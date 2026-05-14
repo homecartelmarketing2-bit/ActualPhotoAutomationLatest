@@ -106,14 +106,67 @@ Dependencies: `pip install -r stage2-supplier-bot/requirements.txt`
 
 ## Running both stages
 
-The two stages share a Zoho refresh token and a few environment variables but
-are otherwise independent — run each in its own process / Windows Task / VM
-service. Stage 1 is a single-process loop; Stage 2 is a multi-threaded bot.
+The repo has a **single top-level launcher** that starts both stages from one
+command. It launches each stage as its own child process, so a single `Ctrl+C`
+cleanly stops both.
 
 ```bash
-# In one shell:
-cd stage1-find-actual-photo && python main.py
+# Run BOTH stages (the default):
+python app.py
 
-# In another shell:
+# Run only one stage:
+python app.py --stage stage1
+python app.py --stage stage2
+
+# Dry-run BOTH stages — log what each would do, without uploading files,
+# sending Telegram messages, or updating Zoho records. Safe to run against
+# live credentials.
+python app.py --dry-run
+
+# One-shot end-to-end test:
+#   Stage 1 processes a single eligible record and exits.
+#   Stage 2 polls once, sends the Telegram request(s), then keeps the
+#   Telegram listener alive long enough to receive replies (default
+#   5 minutes), then exits.
+python app.py --once
+```
+
+You can still run each stage directly if you prefer (the previous entry
+points are unchanged):
+
+```bash
+cd stage1-find-actual-photo && python -m actual_photo_automation
 cd stage2-supplier-bot && python app.py
+```
+
+### Testing the "Supplier Actual Photo" flow in one run
+
+1. In Zoho `All_Encoding_Requests`, create a test row with:
+   - `Type_of_Request = "Supplier Actual Photo"`
+   - `Request_Status = "Pending"`
+   - a real `Product_Name` (and SKU mapping in Akeneo)
+   - `Remarks_Notes` left blank
+2. From the supplier's Telegram group, send `/register` to the bot once.
+3. Run a safe end-to-end test:
+   ```bash
+   python app.py --stage stage2 --once
+   ```
+   You should see:
+   - Stage 2 logs: `Type='Supplier Actual Photo'  Product=...`
+   - A Telegram message in the supplier group with the catalog photo
+     and the request text
+   - An admin DM tagged `— Supplier Actual Photo`
+4. Reply to the Telegram message with a photo within 5 minutes. The bot
+   uploads it to the Zoho record's `Actual_Photo1` field, mirrors it to
+   Akeneo, and sets `Request_Status = "Done"`. Then the `--once` runner
+   exits on its own.
+5. For a regression check, do the same with
+   `Type_of_Request = "Actual Photo"` and no trigger text in
+   `Remarks_Notes`: the bot **must ignore** the row.
+
+To preview what would happen without actually sending Telegram messages or
+updating Zoho:
+
+```bash
+python app.py --dry-run
 ```
