@@ -22,6 +22,34 @@ def main():
         metavar="SKU",
         help="Check Akeneo for actual + catalog photo for the given SKU and exit.",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Log which Zoho records would be processed without sending "
+            "Telegram messages or updating Zoho. Useful for verifying the "
+            "query and Akeneo lookups against live data."
+        ),
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help=(
+            "Do one poll cycle, then keep the Telegram listener alive long "
+            "enough to receive replies (default: 5 minutes), then exit. "
+            "Useful for end-to-end testing of the supplier flow in a "
+            "single run."
+        ),
+    )
+    parser.add_argument(
+        "--once-reply-window-seconds",
+        type=int,
+        default=run.ONCE_REPLY_WINDOW_SECONDS,
+        help=(
+            "How long --once waits for Telegram replies before exiting "
+            f"(default: {run.ONCE_REPLY_WINDOW_SECONDS}s)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.debug_fields:
@@ -40,7 +68,11 @@ def main():
             print(f"  No catalog photo found in Akeneo. (Akeneo ID: {identifier or 'not found'})")
         sys.exit(0)
 
-    run.run()
+    run.run(
+        dry_run=args.dry_run,
+        once=args.once,
+        once_reply_window_seconds=args.once_reply_window_seconds,
+    )
 
 
 if __name__ == "__main__":
