@@ -50,13 +50,30 @@ def _report_url():
     )
 
 
+def _supported_types_criteria() -> str:
+    """Build the Zoho criteria fragment matching any supported request type."""
+    return "||".join(
+        f'Type_of_Request=="{t}"' for t in config.SUPPORTED_REQUEST_TYPES
+    )
+
+
 def get_pending_records():
     """
-    Return all records in All_Encoding_Requests where:
-      - Request_Status == "Pending"
-      - Remarks_Notes contains the trigger text set in config
-    Uses server-side criteria for status; filters remarks in Python.
+    Return Pending / In-progress records in All_Encoding_Requests whose
+    Type_of_Request is one of the SUPPORTED_REQUEST_TYPES.
+
+    Then apply the Stage-1 trigger-text filter on top:
+      - "Actual Photo" rows are kept only if Remarks_Notes contains
+        TRIGGER_TEXT (Stage 1 already tried and found nothing).
+      - Rows whose type is in DIRECT_TO_SUPPLIER_REQUEST_TYPES (currently
+        just "Supplier Actual Photo") bypass the trigger-text filter and
+        are routed straight to the supplier.
     """
+    criteria = (
+        '(Request_Status=="Pending"||Request_Status=="In progress")'
+        f'&&({_supported_types_criteria()})'
+    )
+
     all_records = []
     start = 0
     page_size = 200
@@ -66,8 +83,7 @@ def get_pending_records():
             _report_url(),
             headers=_auth.headers(),
             params={
-                # Only "Actual Photo" requests that are still Pending
-                "criteria": '(Request_Status=="Pending"||Request_Status=="In progress")&&(Type_of_Request=="Actual Photo")',
+                "criteria": criteria,
                 "from":     start,
                 "limit":    page_size,
             },
@@ -82,22 +98,39 @@ def get_pending_records():
             break
         start += page_size
 
-    # Further filter: only those where Remarks_Notes contains the trigger text
-    # (i.e. the original automation already tried and found nothing)
-    filtered = [
-        r for r in all_records
-        if config.TRIGGER_TEXT.lower() in str(r.get("Remarks_Notes", "")).lower()
-    ]
+    trigger_lower = config.TRIGGER_TEXT.lower()
+    filtered = []
+    direct_count = 0
+    actual_count = 0
+    for r in all_records:
+        request_type = str(r.get("Type_of_Request", "")).strip()
+        if request_type in config.DIRECT_TO_SUPPLIER_REQUEST_TYPES:
+            filtered.append(r)
+            direct_count += 1
+            continue
+        if request_type == config.REQUEST_TYPE_ACTUAL_PHOTO:
+            if trigger_lower in str(r.get("Remarks_Notes", "")).lower():
+                filtered.append(r)
+                actual_count += 1
+
     log.info(
-        f"Zoho: {len(all_records)} Pending/In-progress Actual-Photo records, (filtered {len(filtered)})"
+        f"Zoho: {len(all_records)} Pending/In-progress supported records "
+        f"-> filtered {len(filtered)} actionable "
+        f"({actual_count} Actual Photo w/ trigger, {direct_count} direct-to-supplier)"
     )
     return filtered
 
 
 def search_record_by_product_name(product_name: str) -> dict | None:
     """
-    Search for a pending or in-progress record by Product_Name match.
+    Search for a pending or in-progress record by Product_Name match, across
+    all supported request types ("Actual Photo" and "Supplier Actual Photo").
     """
+    criteria = (
+        '(Request_Status=="Pending"||Request_Status=="In progress")'
+        f'&&({_supported_types_criteria()})'
+    )
+
     all_records = []
     start = 0
     page_size = 200
@@ -107,7 +140,7 @@ def search_record_by_product_name(product_name: str) -> dict | None:
             _report_url(),
             headers=_auth.headers(),
             params={
-                "criteria": '(Request_Status=="Pending"||Request_Status=="In progress")&&(Type_of_Request=="Actual Photo")',
+                "criteria": criteria,
                 "from":     start,
                 "limit":    page_size,
             },

@@ -121,8 +121,9 @@ def _poll_once(state: dict):
         product_name = _extract_product_name(record)
         # Remarks_Notes2 is the "Sales Notes" field in the Zoho UI
         sales_notes  = str(record.get("Remarks_Notes2") or "").strip()
+        request_type = str(record.get("Type_of_Request") or "").strip()
 
-        log.info(f"New pending record: {record_id}  Product={product_name}")
+        log.info(f"New pending record: {record_id}  Type={request_type!r}  Product={product_name}")
 
         # Single Akeneo lookup — gets identifier, actual photo status, and catalog photo
         akeneo_identifier = ""
@@ -157,7 +158,8 @@ def _poll_once(state: dict):
 
         # Send to Telegram
         message_id = bot.send_photo_request(
-            chat_id, product_name, akeneo_identifier, sales_notes, photo_bytes
+            chat_id, product_name, akeneo_identifier, sales_notes, photo_bytes,
+            request_type=request_type,
         )
         if message_id is None:
             log.error(f"  Failed to send Telegram message for record {record_id}. Will retry next poll.")
