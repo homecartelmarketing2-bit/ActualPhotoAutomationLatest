@@ -1,0 +1,42 @@
+{
+  "sample_record_count": 1,
+  "sample_record_keys": [
+    "Actual_Photo1",
+    "Added_Time",
+    "Added_User",
+    "Auto_Number",
+    "Checker_s_Note",
+    "Client",
+    "ID",
+    "Image_Attachment",
+    "Modified_Time",
+    "Modified_User",
+    "Product_Name",
+    "Remarks_Notes",
+    "Remarks_Notes2",
+    "Request_Status",
+    "Requestor",
+    "Type_of_Request",
+    "Video"
+  ],
+  "sample_record": {
+    "Modified_User": "homecartel",
+    "Type_of_Request": "Actual Photo",
+    "Modified_Time": "06-Apr-2026 11:20:43",
+    "Image_Attachment": [],
+    "Remarks_Notes2": "",
+    "Actual_Photo1": [],
+    "Product_Name": "Svana Cirque",
+    "Request_Status": "Pending",
+    "Auto_Number": "321",
+    "Remarks_Notes": "No files were successfully uploaded for Svana Cirque (2 failed download/upload)",
+    "Video": "",
+    "Added_User": "homecartelsales1",
+    "ID": "4662244000011457016",
+    "Checker_s_Note": "",
+    "Requestor": "Sales 5",
+    "Client": "Ar. Katherine",
+    "Added_Time": "06-Apr-2026 10:45:41"
+  },
+  "form_fields_error": "encoding_form is not configured; set it to fetch full field metadata."
+}

@@ -1,0 +1,13 @@
+__pycache__/
+build/
+dist/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+*.log
+*.spec
+hcspec_state.json
