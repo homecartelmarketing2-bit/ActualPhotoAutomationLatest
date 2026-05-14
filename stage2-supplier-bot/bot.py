@@ -54,10 +54,17 @@ def send_invalid_record_alert(record_id: str, missing_fields: list[str], product
 
 
 def send_photo_request(chat_id: int, product_name: str, akeneo_identifier: str,
-                       sales_notes: str, photo_bytes: bytes | None) -> int | None:
+                       sales_notes: str, photo_bytes: bytes | None,
+                       request_type: str = "") -> int | None:
     """
     Send a catalog photo (or text-only if none) to the group.
     Returns the sent message_id on success, or None.
+
+    The Telegram caption shown to the supplier is identical regardless of
+    request_type (the underlying ask is the same: provide an actual photo).
+    request_type is only used to tag the admin DM so the admin can see at a
+    glance whether this row went through Stage 1 first or came in as a direct
+    supplier request.
     """
     missing_fields = missing_request_fields(product_name, akeneo_identifier)
     if missing_fields:
@@ -89,7 +96,12 @@ def send_photo_request(chat_id: int, product_name: str, akeneo_identifier: str,
     
     # Send private DM to admin with the actual product name
     if message_id:
-        admin_text = f"📢 *New Request Sent to Group*\nSKU: {akeneo_identifier}\nName: {product_name}"
+        type_label = f" — {request_type}" if request_type else ""
+        admin_text = (
+            f"📢 *New Request Sent to Group*{type_label}\n"
+            f"SKU: {akeneo_identifier}\n"
+            f"Name: {product_name}"
+        )
         send_admin_message(admin_text)
 
     return message_id

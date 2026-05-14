@@ -81,8 +81,32 @@ LOG_FILE = os.fspath(_runtime_dir() / "hcspec_bot.log")
 PLACEHOLDER_IMAGE = os.fspath(_bundle_dir() / "actual_photo_not_available.png")
 
 # ── Remarks text that signals this bot should act ────────────────────────────
-# Matches the text written by the original automation when no photo is found
+# Matches the text written by the Stage-1 automation (Crm-Actual-Photo) when
+# no photo is found in Zoho WorkDrive / Archive / Akeneo.
 TRIGGER_TEXT = "Not available from Kanban Notes / Zoho Drive / Akeneo"
+
+# ── Request types handled by this bot ────────────────────────────────────────
+# "Actual Photo": handled only after Stage 1 (Crm-Actual-Photo) has tried
+#                 and failed, i.e. it has written TRIGGER_TEXT into
+#                 Remarks_Notes.
+# "Supplier Actual Photo": handled immediately for any Pending / In progress
+#                         row. Used when the requestor already knows the
+#                         photo must come straight from the supplier, so
+#                         Stage 1's WorkDrive/Archive search is skipped.
+REQUEST_TYPE_ACTUAL_PHOTO          = "Actual Photo"
+REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO = "Supplier Actual Photo"
+
+# All request types this bot will poll for in Zoho.
+SUPPORTED_REQUEST_TYPES = (
+    REQUEST_TYPE_ACTUAL_PHOTO,
+    REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+)
+
+# Request types that bypass the Stage-1 Remarks_Notes trigger-text filter and
+# go straight to the supplier.
+DIRECT_TO_SUPPLIER_REQUEST_TYPES = (
+    REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
