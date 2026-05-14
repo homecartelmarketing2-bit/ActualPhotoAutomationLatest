@@ -20,6 +20,13 @@ from config import log
 # Event to wake the poller immediately (e.g. after /register)
 _poll_trigger = threading.Event()
 
+# Test-mode flags. Set by run() at start-up.
+#   _dry_run: log actions but skip Telegram sends and Zoho writes.
+#   _run_once: do a single poll cycle, give Telegram a window to receive
+#              replies, then exit (no follow-up loop).
+_dry_run: bool = False
+_run_once: bool = False
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -101,8 +108,15 @@ def poller_loop(state: dict, stop_event: threading.Event):
 def _poll_once(state: dict):
     chat_id = state_mod.get_chat_id(state)
     if not chat_id:
-        log.warning("No Telegram chat_id configured. Send /register to the bot first.")
-        return
+        if _dry_run:
+            log.info(
+                "[dry-run] No Telegram chat_id configured; continuing so the "
+                "dry-run can still show which Zoho rows would be picked up."
+            )
+            chat_id = 0  # sentinel — we won’t actually send anything
+        else:
+            log.warning("No Telegram chat_id configured. Send /register to the bot first.")
+            return
 
     log.info("Polling Zoho for pending records...")
     try:
@@ -155,6 +169,19 @@ def _poll_once(state: dict):
             continue
 
         state_mod.clear_invalid_record(state, record_id)
+
+        if _dry_run:
+            log.info(
+                f"  [dry-run] Would send Telegram to chat_id={chat_id} "
+                f"for record {record_id} "
+                f"(Type={request_type!r}, Product={product_name!r}, "
+                f"SKU={akeneo_identifier!r}, catalog_photo="
+                f"{'yes' if photo_bytes else 'no'})"
+            )
+            log.info(
+                f"  [dry-run] Would set Request_Status='In progress' on Zoho record {record_id}"
+            )
+            continue
 
         # Send to Telegram
         message_id = bot.send_photo_request(
@@ -244,12 +271,38 @@ def telegram_loop(state: dict, stop_event: threading.Event):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def run():
+# How long the --once mode keeps the Telegram listener alive after a single
+# poll so the supplier has time to reply. Override per-call via run().
+ONCE_REPLY_WINDOW_SECONDS = 300
+
+
+def run(dry_run: bool = False, once: bool = False,
+        once_reply_window_seconds: int = ONCE_REPLY_WINDOW_SECONDS):
+    """
+    Start the bot.
+
+    dry_run
+        If True, log what would happen but skip Telegram sends and Zoho writes.
+        Still hits Zoho (read-only) and Akeneo (read-only) to exercise the
+        full query path.
+    once
+        If True, do a single poll cycle and then keep the Telegram listener
+        alive for `once_reply_window_seconds` so the supplier has time to
+        reply, then exit. No follow-up loop runs. Useful for end-to-end tests.
+    """
+    global _dry_run, _run_once
+    _dry_run = dry_run
+    _run_once = once
+
     state = state_mod.load()
     _clear_invalid_pending_entries(state, "startup cleanup")
     state_mod.save(state)
     log.info("=" * 60)
     log.info("  HC SPEC BOT STARTED")
+    if dry_run:
+        log.info("  Mode:             DRY-RUN (no Telegram sends, no Zoho writes)")
+    if once:
+        log.info(f"  Mode:             ONCE (single poll, exit after {once_reply_window_seconds}s)")
     log.info(f"  Poll interval:    {config.POLL_INTERVAL}s")
     log.info(f"  Follow-up after:  {config.FOLLOWUP_INTERVAL}s")
     log.info(f"  Pending records:  {len(state.get('pending', {}))}")
@@ -259,6 +312,10 @@ def run():
     else:
         log.warning("  Telegram chat_id NOT set — send /register to the bot!")
     log.info("=" * 60)
+
+    if once:
+        _run_once_cycle(state, once_reply_window_seconds)
+        return
 
     stop_event = threading.Event()
 
@@ -283,3 +340,35 @@ def run():
         for t in threads:
             t.join(timeout=5)
         log.info("HC SPEC Bot stopped.")
+
+
+def _run_once_cycle(state: dict, reply_window_seconds: int):
+    """Run one poll, then briefly listen for Telegram replies, then exit."""
+    _poll_once(state)
+
+    if _dry_run:
+        log.info("[dry-run] --once: skipping Telegram reply window.")
+        return
+
+    stop_event = threading.Event()
+    bot.set_poll_trigger(_poll_trigger)
+
+    telegram_thread = threading.Thread(
+        target=telegram_loop, args=(state, stop_event), daemon=True, name="Telegram",
+    )
+    telegram_thread.start()
+
+    log.info(
+        f"--once: poll cycle complete. Listening for Telegram replies for "
+        f"{reply_window_seconds}s before exiting (Ctrl+C to stop early)."
+    )
+    try:
+        deadline = time.monotonic() + reply_window_seconds
+        while time.monotonic() < deadline:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Stopping early (Ctrl+C)...")
+    finally:
+        stop_event.set()
+        telegram_thread.join(timeout=5)
+        log.info("--once: exiting.")
