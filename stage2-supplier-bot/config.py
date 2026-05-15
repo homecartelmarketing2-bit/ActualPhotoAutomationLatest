@@ -57,6 +57,22 @@ AKENEO_CATALOG_ATTRS = [
     "another_picture_6",
 ]
 
+# Akeneo actual-photo SLOTS. When the supplier uploads a photo, the bot
+# fills the FIRST empty slot in this list. Defaults match the live Akeneo
+# attribute codes (verified via --list-attributes):
+#   Actual_Photo       ← UI "Actual Photo"
+#   another_picture_5  ← UI "Actual Photo 2"
+#   another_picture_6  ← UI "Actual Photo 3"
+# Override via comma-separated AKENEO_PHOTO_ATTRIBUTES env var if needed.
+AKENEO_PHOTO_ATTRIBUTES = [
+    a.strip()
+    for a in os.environ.get(
+        "AKENEO_PHOTO_ATTRIBUTES",
+        "Actual_Photo,another_picture_5,another_picture_6",
+    ).split(",")
+    if a.strip()
+]
+
 # ── Telegram ─────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8766106835:AAHKF7uoEevrZBVhlla6cv9C_m_9_0L9uh0")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")   # set via env or /register
