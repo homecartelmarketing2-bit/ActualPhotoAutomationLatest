@@ -46,6 +46,7 @@ def _default_state() -> dict:
         "pending":                {},
         "message_to_record":      {},
         "invalid_records":        {},
+        "processed_records":      {},
     }
 
 
@@ -54,7 +55,12 @@ def _normalize_state(state: dict | None) -> dict:
     if isinstance(state, dict):
         merged.update(state)
 
-    for key in ("pending", "message_to_record", "invalid_records"):
+    for key in (
+        "pending",
+        "message_to_record",
+        "invalid_records",
+        "processed_records",
+    ):
         if not isinstance(merged.get(key), dict):
             merged[key] = {}
 
@@ -96,12 +102,14 @@ def set_chat_id(state: dict, chat_id: int):
 
 
 def add_pending(state: dict, record_id: str, product_name: str, sales_notes: str,
-                akeneo_identifier: str, message_id: int, sent_time: str):
+                akeneo_identifier: str, message_id: int, sent_time: str,
+                request_type: str = ""):
     with _lock:
         state["pending"][record_id] = {
             "product_name":       product_name,
             "sales_notes":        sales_notes,
             "akeneo_identifier":  akeneo_identifier,   # Akeneo product id/code for uploads
+            "request_type":       request_type,
             "telegram_message_id": message_id,
             "sent_time":          sent_time,
             "last_sent_time":     sent_time,
@@ -176,6 +184,58 @@ def clear_invalid_record(state: dict, record_id: str) -> bool:
     removed = False
     with _lock:
         removed = state["invalid_records"].pop(record_id, None) is not None
+    if removed:
+        save(state)
+    return removed
+
+
+def mark_processed(
+    state: dict,
+    record_id: str,
+    request_type: str,
+    *,
+    final_status: str = "",
+    product_name: str = "",
+    akeneo_identifier: str = "",
+) -> None:
+    """
+    Record that we have finished processing a record so the poller does not
+    immediately pick it up again on the next cycle.
+
+    Used mainly for "Supplier Actual Photo" records, which are now polled
+    regardless of Request_Status — once the supplier has replied and the
+    record has been marked Done / NOT AVAILABLE, we don't want to re-send the
+    Telegram request on every poll.
+    """
+    with _lock:
+        state["processed_records"][record_id] = {
+            "request_type":      request_type,
+            "final_status":      final_status,
+            "product_name":      product_name,
+            "akeneo_identifier": akeneo_identifier,
+            "processed_at":      _now_iso(),
+        }
+    save(state)
+
+
+def is_processed(state: dict, record_id: str, request_type: str) -> bool:
+    """Return True if we previously processed this record for this request type."""
+    with _lock:
+        entry = state["processed_records"].get(record_id)
+        if not entry:
+            return False
+        # If the dropdown has been changed to a different request type since we
+        # last processed, don't skip — treat it as a fresh request.
+        if entry.get("request_type") and entry["request_type"] != request_type:
+            return False
+        return True
+
+
+def clear_processed(state: dict, record_id: str) -> bool:
+    """Forget a previously processed record so it can be re-sent if needed."""
+    removed = False
+    with _lock:
+        removed = state["processed_records"].pop(record_id, None) is not None
     if removed:
         save(state)
     return removed

@@ -108,6 +108,53 @@ DIRECT_TO_SUPPLIER_REQUEST_TYPES = (
     REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
 )
 
+# Request types where the bot ignores the Pending / In progress status filter
+# and acts on any Request_Status. Used so sales can flip the dropdown to
+# "Supplier Actual Photo" on an already-Done row and have the bot pick it up.
+ANY_STATUS_REQUEST_TYPES = (
+    REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+)
+
+# ── Request_Status values used by this bot ───────────────────────────────────
+# These match the dropdown options on the Zoho Creator "Encoding Request" form
+# exactly (case-sensitive): Pending / In progress / Done / Not available / Other.
+STATUS_DONE          = os.environ.get("STATUS_DONE",          "Done")
+STATUS_IN_PROGRESS   = os.environ.get("STATUS_IN_PROGRESS",   "In progress")
+STATUS_NOT_AVAILABLE = os.environ.get("STATUS_NOT_AVAILABLE", "Not available")
+STATUS_PENDING       = os.environ.get("STATUS_PENDING",       "Pending")
+
+# Open statuses — the bot picks these up for normal "Actual Photo" requests.
+OPEN_STATUSES = (STATUS_PENDING, STATUS_IN_PROGRESS)
+
+# Remarks the bot writes when the supplier uploads a photo/video via Telegram.
+REMARKS_AUTOMATED_FROM_SUPPLIER = os.environ.get(
+    "REMARKS_AUTOMATED_FROM_SUPPLIER",
+    "This is automated na uploaded from supplier",
+)
+
+# ── Zoho field names for upload destinations ─────────────────────────────────
+# These are the API names (not the UI display names). They follow Zoho
+# Creator's apostrophe convention (e.g. UI "Checker's Note" → API
+# "Checker_s_Note"). They can be overridden via env vars if Zoho's API names
+# differ from the defaults below.
+#
+#   Supplier_s_Actual_Photo  ← UI "Supplier's Actual Photo"
+#   Internal_Actual_Photo    ← UI "Internal Actual Photo"
+#   Internal_Actual_Video    ← UI "Internal Actual Video"
+FIELD_SUPPLIER_ACTUAL_PHOTO = os.environ.get(
+    "FIELD_SUPPLIER_ACTUAL_PHOTO", "Supplier_s_Actual_Photo"
+)
+FIELD_INTERNAL_ACTUAL_PHOTO = os.environ.get(
+    "FIELD_INTERNAL_ACTUAL_PHOTO", "Internal_Actual_Photo"
+)
+FIELD_INTERNAL_ACTUAL_VIDEO = os.environ.get(
+    "FIELD_INTERNAL_ACTUAL_VIDEO", "Internal_Actual_Video"
+)
+# Legacy fields that the bot used before "Internal & Supplier's Actual Photo"
+# was added to the form. Kept as fallbacks so existing records still work.
+FIELD_LEGACY_ACTUAL_PHOTO = os.environ.get("FIELD_LEGACY_ACTUAL_PHOTO", "Actual_Photo1")
+FIELD_LEGACY_VIDEO        = os.environ.get("FIELD_LEGACY_VIDEO",        "Video")
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
