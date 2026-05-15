@@ -126,10 +126,28 @@ def get_pending_records():
         actual_photo_records = _fetch_records(actual_photo_criteria)
 
     # 2. Any-status request types (e.g. "Supplier Actual Photo"): no status filter.
+    # If the Zoho form doesn't have one of these as a valid dropdown option
+    # (yet), Zoho rejects the criteria with a 400. We don't want that to
+    # block processing of the standard "Actual Photo" records returned by
+    # query #1, so the second query is best-effort.
     any_status_records: list[dict] = []
     if config.ANY_STATUS_REQUEST_TYPES:
         any_status_criteria = f'({_types_criteria(config.ANY_STATUS_REQUEST_TYPES)})'
-        any_status_records = _fetch_records(any_status_criteria)
+        try:
+            any_status_records = _fetch_records(any_status_criteria)
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", "?")
+            body = getattr(exc.response, "text", "")[:300]
+            log.warning(
+                f"Zoho any-status query failed ({status}) for criteria "
+                f"{any_status_criteria!r} — continuing with Actual Photo "
+                f"results only. Body: {body!r}"
+            )
+        except Exception as exc:
+            log.warning(
+                f"Zoho any-status query raised {type(exc).__name__}: {exc} "
+                f"— continuing with Actual Photo results only."
+            )
 
     # Merge, de-duplicating by record ID.
     seen_ids: set[str] = set()
