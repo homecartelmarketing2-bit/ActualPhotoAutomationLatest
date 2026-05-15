@@ -126,10 +126,27 @@ STATUS_PENDING       = os.environ.get("STATUS_PENDING",       "Pending")
 # Open statuses — the bot picks these up for normal "Actual Photo" requests.
 OPEN_STATUSES = (STATUS_PENDING, STATUS_IN_PROGRESS)
 
-# Remarks the bot writes when the supplier uploads a photo/video via Telegram.
+# Remarks the bot writes when the supplier uploads a photo/video via Telegram
+# for a regular "Actual Photo" record (Stage 1 fell through to Stage 2).
 REMARKS_AUTOMATED_FROM_SUPPLIER = os.environ.get(
     "REMARKS_AUTOMATED_FROM_SUPPLIER",
     "This is automated na uploaded from supplier",
+)
+
+# Remarks specifically for "Supplier Actual Photo" records — Sales pre-decided
+# the request goes straight to the supplier, so the wording differs from the
+# regular "Actual Photo" path. Written into Remarks_Notes (the Remarks/Notes
+# field inside the "Internal & Supplier's Actual Photo" section of the form).
+REMARKS_SUPPLIER_PHOTO_RECEIVED = os.environ.get(
+    "REMARKS_SUPPLIER_PHOTO_RECEIVED",
+    "Automated Retrieval of Actual Photos/Videos from Supplier. "
+    "Please check attachment if accurate",
+)
+REMARKS_SUPPLIER_NOT_AVAILABLE = os.environ.get(
+    "REMARKS_SUPPLIER_NOT_AVAILABLE",
+    "Actual photo is not available from the supplier. "
+    "You may request a Generated Actual Photo by changing the "
+    "\u201cType of Request\u201d to \u201cGenerated Actual Photo.\u201d",
 )
 
 # ── Zoho field names for upload destinations ─────────────────────────────────
