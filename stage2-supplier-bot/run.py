@@ -136,8 +136,27 @@ def _poll_once(state: dict):
         # Remarks_Notes2 is the "Sales Notes" field in the Zoho UI
         sales_notes  = str(record.get("Remarks_Notes2") or "").strip()
         request_type = str(record.get("Type_of_Request") or "").strip()
+        current_status = str(record.get("Request_Status") or "").strip()
 
-        log.info(f"New pending record: {record_id}  Type={request_type!r}  Product={product_name}")
+        # Skip records we have already processed for this request type, unless
+        # they have been re-opened (Request_Status is back to Pending /
+        # In progress). This is what stops "Supplier Actual Photo" records
+        # from being re-sent on every poll once they're Done / NOT AVAILABLE.
+        if state_mod.is_processed(state, record_id, request_type):
+            if current_status in config.OPEN_STATUSES:
+                log.info(
+                    f"Record {record_id} previously processed but is now "
+                    f"{current_status!r} again — re-processing."
+                )
+                state_mod.clear_processed(state, record_id)
+            else:
+                log.debug(
+                    f"Skipping record {record_id} (already processed, "
+                    f"status={current_status!r})."
+                )
+                continue
+
+        log.info(f"New pending record: {record_id}  Type={request_type!r}  Product={product_name}  Status={current_status!r}")
 
         # Single Akeneo lookup — gets identifier, actual photo status, and catalog photo
         akeneo_identifier = ""
@@ -195,13 +214,14 @@ def _poll_once(state: dict):
         sent_time = _now_iso()
         state_mod.add_pending(
             state, record_id, product_name, sales_notes,
-            akeneo_identifier, message_id, sent_time
+            akeneo_identifier, message_id, sent_time,
+            request_type=request_type,
         )
 
         # Update Zoho status to show we are waiting
         try:
             zoho.update_record(record_id, {
-                "Request_Status": "In progress",
+                "Request_Status": config.STATUS_IN_PROGRESS,
             })
         except Exception as exc:
             log.warning(f"  Could not update Zoho record {record_id} status: {exc}")

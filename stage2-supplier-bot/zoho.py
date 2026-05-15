@@ -57,27 +57,21 @@ def _supported_types_criteria() -> str:
     )
 
 
-def get_pending_records():
-    """
-    Return Pending / In-progress records in All_Encoding_Requests whose
-    Type_of_Request is one of the SUPPORTED_REQUEST_TYPES.
+def _types_criteria(types) -> str:
+    """Build a `(Type_of_Request==X||Type_of_Request==Y)` criteria fragment."""
+    return "||".join(f'Type_of_Request=="{t}"' for t in types)
 
-    Then apply the Stage-1 trigger-text filter on top:
-      - "Actual Photo" rows are kept only if Remarks_Notes contains
-        TRIGGER_TEXT (Stage 1 already tried and found nothing).
-      - Rows whose type is in DIRECT_TO_SUPPLIER_REQUEST_TYPES (currently
-        just "Supplier Actual Photo") bypass the trigger-text filter and
-        are routed straight to the supplier.
-    """
-    criteria = (
-        '(Request_Status=="Pending"||Request_Status=="In progress")'
-        f'&&({_supported_types_criteria()})'
-    )
 
-    all_records = []
+def _open_status_criteria() -> str:
+    """`(Request_Status==Pending || Request_Status==In progress)`."""
+    return "||".join(f'Request_Status=="{s}"' for s in config.OPEN_STATUSES)
+
+
+def _fetch_records(criteria: str) -> list[dict]:
+    """Page through Zoho Creator records matching `criteria`."""
+    all_records: list[dict] = []
     start = 0
     page_size = 200
-
     while True:
         resp = requests.get(
             _report_url(),
@@ -97,12 +91,62 @@ def get_pending_records():
         if len(page) < page_size:
             break
         start += page_size
+    return all_records
+
+
+def get_pending_records():
+    """
+    Return actionable records in All_Encoding_Requests.
+
+    Two separate Zoho queries are issued and merged:
+
+      1. "Actual Photo" rows whose Request_Status is Pending / In progress.
+         These are kept only if Remarks_Notes contains TRIGGER_TEXT
+         (Stage 1 already tried and found nothing).
+
+      2. Rows whose Type_of_Request is in ANY_STATUS_REQUEST_TYPES
+         (currently just "Supplier Actual Photo"). These are fetched
+         regardless of Request_Status so that when sales changes the
+         dropdown to "Supplier Actual Photo" on an already-Done row,
+         the bot still picks it up. They bypass the trigger-text filter
+         and are routed straight to the supplier.
+
+    Duplicate records (same ID returned from both queries) are
+    de-duplicated, preserving order.
+    """
+    open_status = _open_status_criteria()
+
+    # 1. Standard "Actual Photo" flow: still gated on Pending / In progress.
+    actual_photo_records: list[dict] = []
+    if config.REQUEST_TYPE_ACTUAL_PHOTO not in config.ANY_STATUS_REQUEST_TYPES:
+        actual_photo_criteria = (
+            f'({open_status})'
+            f'&&(Type_of_Request=="{config.REQUEST_TYPE_ACTUAL_PHOTO}")'
+        )
+        actual_photo_records = _fetch_records(actual_photo_criteria)
+
+    # 2. Any-status request types (e.g. "Supplier Actual Photo"): no status filter.
+    any_status_records: list[dict] = []
+    if config.ANY_STATUS_REQUEST_TYPES:
+        any_status_criteria = f'({_types_criteria(config.ANY_STATUS_REQUEST_TYPES)})'
+        any_status_records = _fetch_records(any_status_criteria)
+
+    # Merge, de-duplicating by record ID.
+    seen_ids: set[str] = set()
+    merged: list[dict] = []
+    for r in (*actual_photo_records, *any_status_records):
+        rid = str(r.get("ID", ""))
+        if rid and rid in seen_ids:
+            continue
+        if rid:
+            seen_ids.add(rid)
+        merged.append(r)
 
     trigger_lower = config.TRIGGER_TEXT.lower()
     filtered = []
     direct_count = 0
     actual_count = 0
-    for r in all_records:
+    for r in merged:
         request_type = str(r.get("Type_of_Request", "")).strip()
         if request_type in config.DIRECT_TO_SUPPLIER_REQUEST_TYPES:
             filtered.append(r)
@@ -114,7 +158,7 @@ def get_pending_records():
                 actual_count += 1
 
     log.info(
-        f"Zoho: {len(all_records)} Pending/In-progress supported records "
+        f"Zoho: {len(merged)} supported records "
         f"-> filtered {len(filtered)} actionable "
         f"({actual_count} Actual Photo w/ trigger, {direct_count} direct-to-supplier)"
     )

@@ -312,7 +312,7 @@ def _find_record_for_reply(message: dict, state: dict) -> str | None:
 
 def _handle_photo_reply(message: dict, record_id: str, product_name: str,
                         akeneo_identifier: str, chat_id: int, state: dict):
-    """Download photo → upload to Zoho Actual_Photo1 + Akeneo Actual_Photo → update status."""
+    """Download photo → upload to Zoho Supplier's Actual Photo + Akeneo → update status."""
     photos  = message["photo"]
     best    = max(photos, key=lambda p: p.get("width", 0) * p.get("height", 0))
     file_id = best["file_id"]
@@ -322,13 +322,22 @@ def _handle_photo_reply(message: dict, record_id: str, product_name: str,
         log.error(f"Could not download photo for record {record_id}")
         return
 
+    entry = state.get("pending", {}).get(record_id) or {}
+    request_type = str(entry.get("request_type", "")).strip()
+
     success_zoho   = False
     success_akeneo = False
 
     try:
-        zoho.upload_file(record_id, "Actual_Photo1", photo_bytes, filename="actual_photo.jpg")
+        zoho.upload_file(
+            record_id, config.FIELD_SUPPLIER_ACTUAL_PHOTO,
+            photo_bytes, filename="actual_photo.jpg",
+        )
         success_zoho = True
-        log.info(f"Zoho: uploaded actual photo for record {record_id}")
+        log.info(
+            f"Zoho: uploaded actual photo to {config.FIELD_SUPPLIER_ACTUAL_PHOTO} "
+            f"for record {record_id}"
+        )
     except Exception as exc:
         log.error(f"Zoho upload failed for {record_id}: {exc}")
 
@@ -338,7 +347,7 @@ def _handle_photo_reply(message: dict, record_id: str, product_name: str,
         except Exception as exc:
             log.error(f"Akeneo upload failed for {akeneo_identifier}: {exc}")
 
-    notes = "This is automated uploaded from the supplier please check if its accurate."
+    notes = config.REMARKS_AUTOMATED_FROM_SUPPLIER
     if not success_zoho:
         notes += " (Zoho upload failed — manual check needed)"
     if akeneo_identifier and not success_akeneo:
@@ -346,13 +355,19 @@ def _handle_photo_reply(message: dict, record_id: str, product_name: str,
 
     try:
         zoho.update_record(record_id, {
-            "Request_Status": "Done",
+            "Request_Status": config.STATUS_DONE,
             "Remarks_Notes":  notes,
         })
     except Exception as exc:
         log.error(f"Zoho update_record failed for {record_id}: {exc}")
 
     state_mod.remove_pending(state, record_id)
+    state_mod.mark_processed(
+        state, record_id, request_type,
+        final_status=config.STATUS_DONE,
+        product_name=product_name,
+        akeneo_identifier=akeneo_identifier,
+    )
     _send_text(chat_id, "Thankyou tony! <3")
     _send_text(config.TELEGRAM_ADMIN_ID, f"✅ *Uploaded to CRM (Photo)*\nSKU: {akeneo_identifier}\nName: {product_name}")
     log.info(f"Photo reply handled for record {record_id}")
@@ -375,31 +390,46 @@ def _handle_video_reply(message: dict, record_id: str, product_name: str,
         log.error(f"Could not download video for record {record_id}")
         return
 
+    entry = state.get("pending", {}).get(record_id) or {}
+    request_type = str(entry.get("request_type", "")).strip()
+
     success_zoho   = False
     success_akeneo = False
 
     try:
-        zoho.upload_file(record_id, "Video", video_bytes, filename=filename)
+        zoho.upload_file(
+            record_id, config.FIELD_SUPPLIER_ACTUAL_PHOTO,
+            video_bytes, filename=filename,
+        )
         success_zoho = True
-        log.info(f"Zoho: uploaded video for record {record_id}")
+        log.info(
+            f"Zoho: uploaded supplier video to {config.FIELD_SUPPLIER_ACTUAL_PHOTO} "
+            f"for record {record_id}"
+        )
     except Exception as exc:
         log.error(f"Zoho video upload failed for {record_id}: {exc}")
 
     # Per user request, do not upload videos to Akeneo
     
-    notes = "This is automated uploaded from the supplier please check if its accurate."
+    notes = config.REMARKS_AUTOMATED_FROM_SUPPLIER
     if not success_zoho:
         notes += " (Zoho upload failed)"
 
     try:
         zoho.update_record(record_id, {
-            "Request_Status": "Done",
+            "Request_Status": config.STATUS_DONE,
             "Remarks_Notes":  notes,
         })
     except Exception as exc:
         log.error(f"Zoho update_record failed for {record_id}: {exc}")
 
     state_mod.remove_pending(state, record_id)
+    state_mod.mark_processed(
+        state, record_id, request_type,
+        final_status=config.STATUS_DONE,
+        product_name=product_name,
+        akeneo_identifier=akeneo_identifier,
+    )
     _send_text(chat_id, "Thankyou tony! <3")
     _send_text(config.TELEGRAM_ADMIN_ID, f"✅ *Uploaded to CRM (Video)*\nSKU: {akeneo_identifier}\nName: {product_name}")
     log.info(f"Video reply handled for record {record_id}")
@@ -413,28 +443,44 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
     # Check if the translated text means "actual photo not available"
     is_unavailable = llm.classify_unavailable(translated)
 
+    entry = state.get("pending", {}).get(record_id) or {}
+    request_type = str(entry.get("request_type", "")).strip()
+
     if is_unavailable:
         log.info(f"Supplier says NOT AVAILABLE for record {record_id}: {translated}")
 
-        # Upload the "ACTUAL PHOTO NOT AVAILABLE" placeholder image
+        # Upload the "ACTUAL PHOTO NOT AVAILABLE" placeholder image into the
+        # "Internal Actual Photo" field. This is what fills the row when the
+        # supplier confirms they have no actual photo.
         placeholder = _load_placeholder_image()
         if placeholder:
             try:
-                zoho.upload_file(record_id, "Actual_Photo1", placeholder,
-                                 filename="actual_photo_not_available.png")
-                log.info(f"Zoho: uploaded NOT AVAILABLE placeholder for record {record_id}")
+                zoho.upload_file(
+                    record_id, config.FIELD_INTERNAL_ACTUAL_PHOTO, placeholder,
+                    filename="actual_photo_not_available.png",
+                )
+                log.info(
+                    f"Zoho: uploaded NOT AVAILABLE placeholder to "
+                    f"{config.FIELD_INTERNAL_ACTUAL_PHOTO} for record {record_id}"
+                )
             except Exception as exc:
                 log.error(f"Zoho placeholder upload failed for {record_id}: {exc}")
 
         try:
             zoho.update_record(record_id, {
-                "Request_Status": "Done",
+                "Request_Status": config.STATUS_NOT_AVAILABLE,
                 "Remarks_Notes": f"Supplier confirmed: Actual photo not available. ({translated})",
             })
         except Exception as exc:
             log.error(f"Zoho update_record failed for {record_id}: {exc}")
 
         state_mod.remove_pending(state, record_id)
+        state_mod.mark_processed(
+            state, record_id, request_type,
+            final_status=config.STATUS_NOT_AVAILABLE,
+            product_name=product_name,
+            akeneo_identifier=akeneo_identifier,
+        )
         _send_text(chat_id,
                    f"Thank you Tony! Noted that '{product_name}' has NO ACTUAL PHOTO available. Placeholder uploaded.")
         _send_text(config.TELEGRAM_ADMIN_ID, f"❌ *No Actual Photo Available*\nSKU: {akeneo_identifier}\nName: {product_name}")
@@ -443,7 +489,7 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
     # Normal text reply — just record the translated response
     try:
         zoho.update_record(record_id, {
-            "Request_Status": "Done",
+            "Request_Status": config.STATUS_DONE,
             "Remarks_Notes": f"Supplier response: {translated}",
         })
         log.info(f"Updated Remarks_Notes for record {record_id}: {translated}")
@@ -452,6 +498,12 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
         return
 
     state_mod.remove_pending(state, record_id)
+    state_mod.mark_processed(
+        state, record_id, request_type,
+        final_status=config.STATUS_DONE,
+        product_name=product_name,
+        akeneo_identifier=akeneo_identifier,
+    )
     _send_text(chat_id, f"Thank you Tony! Your response for '{product_name}' has been recorded:\n{translated}")
     _send_text(config.TELEGRAM_ADMIN_ID, f"📝 *Response Recorded*\nSKU: {akeneo_identifier}\nName: {product_name}\nResponse: {translated}")
 
@@ -542,7 +594,10 @@ def _handle_manual_upload(message: dict, sku_keyword: str, chat_id: int, state: 
             return
             
         try:
-            zoho.upload_file(record_id, "Actual_Photo1", photo_bytes, filename="actual_photo.jpg")
+            zoho.upload_file(
+                record_id, config.FIELD_SUPPLIER_ACTUAL_PHOTO,
+                photo_bytes, filename="actual_photo.jpg",
+            )
             success_zoho = True
         except Exception as exc:
             log.error(f"Zoho manual upload failed for {record_id}: {exc}")
@@ -566,7 +621,10 @@ def _handle_manual_upload(message: dict, sku_keyword: str, chat_id: int, state: 
             return
             
         try:
-            zoho.upload_file(record_id, "Video", video_bytes, filename=filename)
+            zoho.upload_file(
+                record_id, config.FIELD_SUPPLIER_ACTUAL_PHOTO,
+                video_bytes, filename=filename,
+            )
             success_zoho = True
         except Exception as exc:
             log.error(f"Zoho video manual upload failed for {record_id}: {exc}")
@@ -580,15 +638,22 @@ def _handle_manual_upload(message: dict, sku_keyword: str, chat_id: int, state: 
     notes = "Uploaded manually via Telegram bot command."
     if not success_zoho: notes += " (Zoho Upload Failed)"
     if akeneo_identifier and not success_akeneo: notes += " (Akeneo Upload Failed)"
-    
+
     try:
         zoho.update_record(record_id, {
-            "Request_Status": "Done",
+            "Request_Status": config.STATUS_DONE,
             "Remarks_Notes": notes,
         })
     except Exception as exc:
         log.error(f"Zoho update_record manual failed for {record_id}: {exc}")
-        
+
+    request_type = str(record.get("Type_of_Request", "")).strip()
     state_mod.remove_pending(state, record_id)
-        
+    state_mod.mark_processed(
+        state, record_id, request_type,
+        final_status=config.STATUS_DONE,
+        product_name=product_name,
+        akeneo_identifier=akeneo_identifier,
+    )
+
     _send_text(chat_id, f"🎉 Done uploading actual photo/video for '{product_name}' and marked as Done in Zoho.")
