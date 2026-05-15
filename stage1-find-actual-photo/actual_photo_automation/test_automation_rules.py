@@ -7,7 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from actual_photo_automation.automation import ActualPhotoAutomation
+from actual_photo_automation.automation import (
+    ActualPhotoAutomation,
+    _extract_subform_items,
+)
 from actual_photo_automation.helpers import MatchResult, MediaCandidate
 from actual_photo_automation.upload_to_akeneo import process_records
 
@@ -145,7 +148,14 @@ class AutomationRulesTests(unittest.TestCase):
         automation = self._make_automation(creator=creator, workdrive=workdrive)
         record = {
             "ID": "1",
-            "Product_Name": "Sample Lamp",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {"Item_Name": "Sample Lamp"},
+                    "SKU": "SKU-1",
+                }
+            ],
             "Type_of_Request": "Pricing",
             "Request_Status": "Pending",
             "Actual_Photo1": [],
@@ -173,7 +183,14 @@ class AutomationRulesTests(unittest.TestCase):
         )
         record = {
             "ID": "2",
-            "Product_Name": "Sample Lamp",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {"Item_Name": "Sample Lamp"},
+                    "SKU": "SKU-1",
+                }
+            ],
             "Type_of_Request": "Actual Photo",
             "Request_Status": "Pending",
             "Actual_Photo1": [],
@@ -204,7 +221,14 @@ class AutomationRulesTests(unittest.TestCase):
         )
         record = {
             "ID": "3",
-            "Product_Name": "Sample Lamp",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {"Item_Name": "Sample Lamp"},
+                    "SKU": "SKU-1",
+                }
+            ],
             "Type_of_Request": "Actual Photo",
             "Request_Status": "Pending",
             "Actual_Photo1": [],
@@ -218,6 +242,116 @@ class AutomationRulesTests(unittest.TestCase):
         self.assertEqual(len(creator.update_calls), 1)
         self.assertNotIn("Request_Status", creator.update_calls[0]["data"])
         self.assertIn("No files were successfully uploaded", creator.update_calls[0]["data"]["Remarks_Notes"])
+
+    def test_process_record_handles_empty_subform_as_missing_product_name(self) -> None:
+        """A record with no `Product_Name1` rows should be treated as missing."""
+        creator = CreatorSpy()
+        workdrive = WorkDriveStub()
+        automation = self._make_automation(creator=creator, workdrive=workdrive)
+        record = {
+            "ID": "5",
+            "Product_Name": "Legacy Name In Top Level",
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+            # No Product_Name1 subform — top-level must NOT be used.
+        }
+
+        outcome = automation.process_record(record)
+
+        self.assertEqual(outcome.source, "none")
+        self.assertIn("Product_Name1", outcome.note)
+        self.assertEqual(workdrive.calls, [])
+        self.assertEqual(creator.upload_calls, [])
+        self.assertEqual(creator.update_calls, [])
+
+    def test_process_record_searches_workdrive_per_subform_item(self) -> None:
+        """Each Product_Name1 row should trigger its own WorkDrive lookup."""
+        creator = CreatorSpy()
+        workdrive = WorkDriveStub()
+        automation = self._make_automation(creator=creator, workdrive=workdrive)
+        record = {
+            "ID": "6",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {"Item_Name": "Lamp One"},
+                    "SKU": "SKU-1",
+                },
+                {
+                    "ID": "row-2",
+                    "Items": {"Item_Name": "Lamp Two"},
+                    "SKU": "SKU-2",
+                },
+            ],
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Actual_Photo1": [],
+            "Video": "",
+        }
+
+        automation.process_record(record)
+
+        # WorkDrive must be queried once per subform item.
+        self.assertEqual(len(workdrive.calls), 2)
+
+
+class SubformExtractionTests(unittest.TestCase):
+    def test_extracts_items_and_skus_from_subform(self) -> None:
+        record = {
+            "ID": "rec-1",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-A",
+                    "Items": {"Item_Name": "Alpha"},
+                    "SKU": "SKU-A",
+                },
+                {
+                    "ID": "row-B",
+                    "Items": {"Item_Name": "Beta"},
+                    "SKU": "SKU-B",
+                },
+            ],
+        }
+
+        items = _extract_subform_items(record)
+
+        self.assertEqual(
+            items,
+            [
+                {"row_id": "row-A", "product_name": "Alpha", "sku": "SKU-A"},
+                {"row_id": "row-B", "product_name": "Beta", "sku": "SKU-B"},
+            ],
+        )
+
+    def test_ignores_top_level_product_name_field(self) -> None:
+        record = {
+            "ID": "rec-1",
+            "Product_Name": "Top Level Should Be Ignored",
+            # No subform at all.
+        }
+        self.assertEqual(_extract_subform_items(record), [])
+
+    def test_falls_back_to_zc_display_value_when_items_missing(self) -> None:
+        record = {
+            "ID": "rec-1",
+            "Product_Name1": [
+                {
+                    "ID": "row-A",
+                    "SKU": "SKU-A",
+                    "zc_display_value": "Alpha SKU-A",
+                },
+            ],
+        }
+
+        items = _extract_subform_items(record)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["product_name"], "Alpha SKU-A")
+        self.assertEqual(items[0]["sku"], "SKU-A")
 
 
 class UploadToAkeneoRulesTests(unittest.TestCase):

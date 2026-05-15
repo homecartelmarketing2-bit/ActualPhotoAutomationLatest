@@ -314,11 +314,20 @@ class ActualPhotoAutomation:
         self, record: dict[str, Any], *, dry_run: bool = False
     ) -> ProcessingOutcome:
         record_id = extract_record_id(record)
-        product_name = scalar_to_text(record.get(self.config["field_product_name"]))
-        if not product_name:
-            message = "Automation could not determine Product Name."
+        subform_items = _extract_subform_items(record)
+        if not subform_items:
+            message = (
+                "Automation could not determine Product Name "
+                "(Product_Name1 subform is empty)."
+            )
             logger.warning("%s Record=%s", message, record_id)
             return ProcessingOutcome(record_id, "", 0, "none", message)
+
+        # Aggregate display name (used for logging/remarks/state) — join the
+        # subform item names so log lines still identify the record at a glance.
+        product_name = " / ".join(
+            item["product_name"] for item in subform_items if item["product_name"]
+        )
 
         request_type = scalar_to_text(record.get(self.config["field_request_type"]))
         expected_type = scalar_to_text(self.config.get("request_type_value", ""))
@@ -348,30 +357,46 @@ class ActualPhotoAutomation:
                 logger.info("%s (record=%s, product=%s)", message, record_id, product_name)
                 return ProcessingOutcome(record_id, product_name, 0, "skip", message)
 
-        search_terms = build_search_terms(product_name)
         all_media: list[MediaCandidate] = []
         sources: list[str] = []
         matched_name = ""
 
-        workdrive_match = self.workdrive.find_best_media_match(
-            self.config["workdrive_parent_folder_id"],
-            search_terms,
-            max_depth=int(self.config["workdrive_search_depth"]),
-            parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
-        )
-        if workdrive_match and workdrive_match.media:
-            all_media.extend(workdrive_match.media)
-            sources.append("workdrive")
-            matched_name = workdrive_match.matched_name
-            logger.info("Found %d file(s) in WorkDrive for %s", len(workdrive_match.media), product_name)
+        # Search WorkDrive + Archive independently for each subform item so
+        # records with multiple `Product_Name1` rows pick up media for every
+        # item, not just the first one.
+        for item in subform_items:
+            item_name = item["product_name"]
+            if not item_name:
+                continue
+            item_terms = build_search_terms(item_name)
+            workdrive_match = self.workdrive.find_best_media_match(
+                self.config["workdrive_parent_folder_id"],
+                item_terms,
+                max_depth=int(self.config["workdrive_search_depth"]),
+                parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
+            )
+            if workdrive_match and workdrive_match.media:
+                all_media.extend(workdrive_match.media)
+                if "workdrive" not in sources:
+                    sources.append("workdrive")
+                if not matched_name:
+                    matched_name = workdrive_match.matched_name
+                logger.info(
+                    "Found %d file(s) in WorkDrive for %s",
+                    len(workdrive_match.media), item_name,
+                )
 
-        archive_match = self.find_archive_match(product_name)
-        if archive_match and archive_match.media:
-            all_media.extend(archive_match.media)
-            sources.append("archive")
-            if not matched_name:
-                matched_name = archive_match.matched_name
-            logger.info("Found %d file(s) in Archive for %s", len(archive_match.media), product_name)
+            archive_match = self.find_archive_match(item_name)
+            if archive_match and archive_match.media:
+                all_media.extend(archive_match.media)
+                if "archive" not in sources:
+                    sources.append("archive")
+                if not matched_name:
+                    matched_name = archive_match.matched_name
+                logger.info(
+                    "Found %d file(s) in Archive for %s",
+                    len(archive_match.media), item_name,
+                )
 
         all_media = unique_media(all_media)
         source_label = "+".join(sources) if sources else "none"
@@ -515,7 +540,11 @@ class ActualPhotoAutomation:
             filter_lower = product_filter.lower()
             records = [
                 r for r in records
-                if filter_lower in scalar_to_text(r.get(self.config["field_product_name"])).lower()
+                if any(
+                    filter_lower in item["product_name"].lower()
+                    or filter_lower in item["sku"].lower()
+                    for item in _extract_subform_items(r)
+                )
             ]
             logger.info("Filtered to %s record(s) matching '%s'", len(records), product_filter)
         # Filter out already-processed records early to save API calls
@@ -572,3 +601,55 @@ class ActualPhotoAutomation:
                 time.sleep(backoff)
                 continue
             time.sleep(poll_interval)
+
+
+def _extract_subform_items(record: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract product items from the ``Product_Name1`` subform.
+
+    Each subform row in the Zoho API response looks like::
+
+        {
+            "ID": "<row_id>",
+            "Items": {"Item_Name": "<product name>", "ID": "..."},
+            "SKU": "<sku>",
+            "zc_display_value": "...",
+        }
+
+    Returns a list of ``{"row_id", "product_name", "sku"}`` dicts \u2014
+    always sourced from the subform. The top-level ``Product_Name``
+    field is intentionally ignored because in the current Zoho form
+    it is empty by design.
+    """
+    rows = record.get("Product_Name1") or []
+    if not isinstance(rows, list):
+        return []
+
+    items: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_id = str(row.get("ID") or "").strip()
+
+        items_obj = row.get("Items") or {}
+        product_name = ""
+        if isinstance(items_obj, dict):
+            for key in ("Item_Name", "zc_display_value", "display_value", "Name"):
+                val = items_obj.get(key)
+                if val and str(val).strip():
+                    product_name = str(val).strip()
+                    break
+        if not product_name:
+            display_val = row.get("zc_display_value") or row.get("display_value")
+            if display_val:
+                product_name = str(display_val).strip()
+
+        sku = str(row.get("SKU") or "").strip()
+        items.append(
+            {
+                "row_id":       row_id,
+                "product_name": product_name,
+                "sku":          sku,
+            }
+        )
+
+    return items

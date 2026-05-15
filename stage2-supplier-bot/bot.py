@@ -240,90 +240,103 @@ def _handle_update(update: dict, state: dict):
         _handle_manual_upload(message, sku_keyword, chat_id, state)
         return
 
-    # Determine which record this is a reply to
-    record_id = _find_record_for_reply(message, state)
-    if not record_id:
+    # Determine which pending item this is a reply to
+    item_key = _find_record_for_reply(message, state)
+    if not item_key:
         return   # Not a reply to a bot request — ignore
 
-    entry = state["pending"].get(record_id)
+    entry = state["pending"].get(item_key)
     if not entry:
         return
 
+    record_id = str(
+        entry.get("record_id") or state_mod.parse_item_key(item_key)[0]
+    )
     product_name      = entry.get("product_name", "")
     akeneo_identifier = entry.get("akeneo_identifier", "")
-    log.info(f"Handling reply for record {record_id} (Product: {product_name})")
+    log.info(
+        f"Handling reply for record {record_id} item_key={item_key} "
+        f"(Product: {product_name})"
+    )
 
     # Photo reply
     if message.get("photo"):
-        _handle_photo_reply(message, record_id, product_name, akeneo_identifier, chat_id, state)
+        _handle_photo_reply(message, item_key, product_name, akeneo_identifier, chat_id, state)
         return
 
     # Video / document that is a video
     if message.get("video") or (
         message.get("document", {}).get("mime_type", "").startswith("video/")
     ):
-        _handle_video_reply(message, record_id, product_name, akeneo_identifier, chat_id, state)
+        _handle_video_reply(message, item_key, product_name, akeneo_identifier, chat_id, state)
         return
 
     # Text reply
     if text:
-        _handle_text_reply(text, record_id, product_name, akeneo_identifier, chat_id, state)
+        _handle_text_reply(text, item_key, product_name, akeneo_identifier, chat_id, state)
         return
 
 
 def _find_record_for_reply(message: dict, state: dict) -> str | None:
     """
-    Map an incoming message to a pending record.
+    Map an incoming message to the composite item-key of a pending entry.
     Priority: reply_to_message.message_id → caption/text SKU match.
     """
     reply_to = message.get("reply_to_message", {})
     if reply_to:
         replied_id = reply_to.get("message_id")
-        rid = state_mod.record_id_for_message(state, replied_id)
-        if rid:
-            return rid
+        key = state_mod.record_id_for_message(state, replied_id)
+        if key:
+            return key
 
-    # Fallback: scan text/caption for a matching product name fragment
+    # Fallback: scan text/caption for a matching product name / SKU fragment
     msg_text = message.get("text") or message.get("caption") or ""
-    for record_id, entry in state["pending"].items():
+    msg_lower = msg_text.lower()
+    for item_key, entry in state["pending"].items():
         name = entry.get("product_name", "")
         sku = entry.get("akeneo_identifier", "")
+        # SKU match wins outright — it disambiguates between items in the
+        # same subform that share a product-name prefix.
+        if sku and sku.lower() in msg_lower:
+            return item_key
         # Match on first word of product name (e.g. "Boden" from "Boden | Brass Marble Table Lamp")
         if name:
             short = name.split("|")[0].strip()
-            if short and short.lower() in msg_text.lower():
-                return record_id
+            if short and short.lower() in msg_lower:
+                return item_key
             # Also check the first two words, and then the first word just in case
             if " " in short:
                 parts = short.split()
                 if len(parts) >= 2:
                     first_two = f"{parts[0]} {parts[1]}"
-                    if first_two.lower() in msg_text.lower():
-                        return record_id
-                
+                    if first_two.lower() in msg_lower:
+                        return item_key
+
                 first_word = parts[0].strip()
-                if first_word and first_word.lower() in msg_text.lower():
-                    return record_id
-        if sku and sku.lower() in msg_text.lower():
-            return record_id
+                if first_word and first_word.lower() in msg_lower:
+                    return item_key
 
     return None
 
 
-def _handle_photo_reply(message: dict, record_id: str, product_name: str,
+def _handle_photo_reply(message: dict, item_key: str, product_name: str,
                         akeneo_identifier: str, chat_id: int, state: dict):
     """Download photo → upload to Zoho Supplier's Actual Photo + Akeneo → update status."""
     photos  = message["photo"]
     best    = max(photos, key=lambda p: p.get("width", 0) * p.get("height", 0))
     file_id = best["file_id"]
 
+    record_id, _ = state_mod.parse_item_key(item_key)
+
     photo_bytes = _download_file(file_id)
     if not photo_bytes:
         log.error(f"Could not download photo for record {record_id}")
         return
 
-    entry = state.get("pending", {}).get(record_id) or {}
+    entry = state.get("pending", {}).get(item_key) or {}
     request_type = str(entry.get("request_type", "")).strip()
+    if entry.get("record_id"):
+        record_id = str(entry["record_id"])
 
     success_zoho   = False
     success_akeneo = False
@@ -353,27 +366,20 @@ def _handle_photo_reply(message: dict, record_id: str, product_name: str,
     if akeneo_identifier and not success_akeneo:
         notes += " (Akeneo upload failed — manual check needed)"
 
-    try:
-        zoho.update_record(record_id, {
-            "Request_Status": config.STATUS_DONE,
-            "Remarks_Notes":  notes,
-        })
-    except Exception as exc:
-        log.error(f"Zoho update_record failed for {record_id}: {exc}")
-
-    state_mod.remove_pending(state, record_id)
-    state_mod.mark_processed(
+    state_mod.remove_pending(state, item_key)
+    _finalize_record_if_last_item(
         state, record_id, request_type,
-        final_status=config.STATUS_DONE,
         product_name=product_name,
         akeneo_identifier=akeneo_identifier,
+        remarks=notes,
+        final_status=config.STATUS_DONE,
     )
     _send_text(chat_id, "Thankyou tony! <3")
     _send_text(config.TELEGRAM_ADMIN_ID, f"✅ *Uploaded to CRM (Photo)*\nSKU: {akeneo_identifier}\nName: {product_name}")
-    log.info(f"Photo reply handled for record {record_id}")
+    log.info(f"Photo reply handled for record {record_id} (item_key={item_key})")
 
 
-def _handle_video_reply(message: dict, record_id: str, product_name: str,
+def _handle_video_reply(message: dict, item_key: str, product_name: str,
                         akeneo_identifier: str, chat_id: int, state: dict):
     """Download video → upload to Zoho Video + Akeneo → update status."""
     video   = message.get("video") or message.get("document", {})
@@ -385,16 +391,19 @@ def _handle_video_reply(message: dict, record_id: str, product_name: str,
     ext      = "." + mime.split("/")[-1] if "/" in mime else ".mp4"
     filename = f"video{ext}"
 
+    record_id, _ = state_mod.parse_item_key(item_key)
+
     video_bytes = _download_file(file_id)
     if not video_bytes:
         log.error(f"Could not download video for record {record_id}")
         return
 
-    entry = state.get("pending", {}).get(record_id) or {}
+    entry = state.get("pending", {}).get(item_key) or {}
     request_type = str(entry.get("request_type", "")).strip()
+    if entry.get("record_id"):
+        record_id = str(entry["record_id"])
 
     success_zoho   = False
-    success_akeneo = False
 
     try:
         zoho.upload_file(
@@ -410,32 +419,25 @@ def _handle_video_reply(message: dict, record_id: str, product_name: str,
         log.error(f"Zoho video upload failed for {record_id}: {exc}")
 
     # Per user request, do not upload videos to Akeneo
-    
+
     notes = config.REMARKS_AUTOMATED_FROM_SUPPLIER
     if not success_zoho:
         notes += " (Zoho upload failed)"
 
-    try:
-        zoho.update_record(record_id, {
-            "Request_Status": config.STATUS_DONE,
-            "Remarks_Notes":  notes,
-        })
-    except Exception as exc:
-        log.error(f"Zoho update_record failed for {record_id}: {exc}")
-
-    state_mod.remove_pending(state, record_id)
-    state_mod.mark_processed(
+    state_mod.remove_pending(state, item_key)
+    _finalize_record_if_last_item(
         state, record_id, request_type,
-        final_status=config.STATUS_DONE,
         product_name=product_name,
         akeneo_identifier=akeneo_identifier,
+        remarks=notes,
+        final_status=config.STATUS_DONE,
     )
     _send_text(chat_id, "Thankyou tony! <3")
     _send_text(config.TELEGRAM_ADMIN_ID, f"✅ *Uploaded to CRM (Video)*\nSKU: {akeneo_identifier}\nName: {product_name}")
-    log.info(f"Video reply handled for record {record_id}")
+    log.info(f"Video reply handled for record {record_id} (item_key={item_key})")
 
 
-def _handle_text_reply(text: str, record_id: str, product_name: str,
+def _handle_text_reply(text: str, item_key: str, product_name: str,
                        akeneo_identifier: str, chat_id: int, state: dict):
     """Translate Tagalog text → check if it means 'not available' → act accordingly."""
     translated = llm.translate_to_english(text)
@@ -443,8 +445,11 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
     # Check if the translated text means "actual photo not available"
     is_unavailable = llm.classify_unavailable(translated)
 
-    entry = state.get("pending", {}).get(record_id) or {}
+    record_id, _ = state_mod.parse_item_key(item_key)
+    entry = state.get("pending", {}).get(item_key) or {}
     request_type = str(entry.get("request_type", "")).strip()
+    if entry.get("record_id"):
+        record_id = str(entry["record_id"])
 
     if is_unavailable:
         log.info(f"Supplier says NOT AVAILABLE for record {record_id}: {translated}")
@@ -466,20 +471,13 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
             except Exception as exc:
                 log.error(f"Zoho placeholder upload failed for {record_id}: {exc}")
 
-        try:
-            zoho.update_record(record_id, {
-                "Request_Status": config.STATUS_NOT_AVAILABLE,
-                "Remarks_Notes": f"Supplier confirmed: Actual photo not available. ({translated})",
-            })
-        except Exception as exc:
-            log.error(f"Zoho update_record failed for {record_id}: {exc}")
-
-        state_mod.remove_pending(state, record_id)
-        state_mod.mark_processed(
+        state_mod.remove_pending(state, item_key)
+        _finalize_record_if_last_item(
             state, record_id, request_type,
-            final_status=config.STATUS_NOT_AVAILABLE,
             product_name=product_name,
             akeneo_identifier=akeneo_identifier,
+            remarks=f"Supplier confirmed: Actual photo not available. ({translated})",
+            final_status=config.STATUS_NOT_AVAILABLE,
         )
         _send_text(chat_id,
                    f"Thank you Tony! Noted that '{product_name}' has NO ACTUAL PHOTO available. Placeholder uploaded.")
@@ -487,25 +485,55 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
         return
 
     # Normal text reply — just record the translated response
-    try:
-        zoho.update_record(record_id, {
-            "Request_Status": config.STATUS_DONE,
-            "Remarks_Notes": f"Supplier response: {translated}",
-        })
-        log.info(f"Updated Remarks_Notes for record {record_id}: {translated}")
-    except Exception as exc:
-        log.error(f"Zoho update_record failed for {record_id}: {exc}")
-        return
-
-    state_mod.remove_pending(state, record_id)
-    state_mod.mark_processed(
+    state_mod.remove_pending(state, item_key)
+    _finalize_record_if_last_item(
         state, record_id, request_type,
-        final_status=config.STATUS_DONE,
         product_name=product_name,
         akeneo_identifier=akeneo_identifier,
+        remarks=f"Supplier response: {translated}",
+        final_status=config.STATUS_DONE,
     )
     _send_text(chat_id, f"Thank you Tony! Your response for '{product_name}' has been recorded:\n{translated}")
     _send_text(config.TELEGRAM_ADMIN_ID, f"📝 *Response Recorded*\nSKU: {akeneo_identifier}\nName: {product_name}\nResponse: {translated}")
+
+
+def _finalize_record_if_last_item(
+    state: dict,
+    record_id: str,
+    request_type: str,
+    *,
+    product_name: str,
+    akeneo_identifier: str,
+    remarks: str,
+    final_status: str,
+) -> None:
+    """Mark a record Done / Not available only when no other subform items are still pending.
+
+    For records with multiple `Product_Name1` subform items, the supplier
+    will reply once per item; we don't want to flip `Request_Status` to
+    Done until every item has been resolved.
+    """
+    if state_mod.record_has_pending_items(state, record_id):
+        log.info(
+            f"Record {record_id}: still has pending subform items — "
+            f"leaving Request_Status as is (this item resolved)."
+        )
+        return
+
+    try:
+        zoho.update_record(record_id, {
+            "Request_Status": final_status,
+            "Remarks_Notes":  remarks,
+        })
+    except Exception as exc:
+        log.error(f"Zoho update_record failed for {record_id}: {exc}")
+
+    state_mod.mark_processed(
+        state, record_id, request_type,
+        final_status=final_status,
+        product_name=product_name,
+        akeneo_identifier=akeneo_identifier,
+    )
 
 
 def _load_placeholder_image() -> bytes | None:
@@ -648,7 +676,20 @@ def _handle_manual_upload(message: dict, sku_keyword: str, chat_id: int, state: 
         log.error(f"Zoho update_record manual failed for {record_id}: {exc}")
 
     request_type = str(record.get("Type_of_Request", "")).strip()
-    state_mod.remove_pending(state, record_id)
+    matching_keys = [
+        key
+        for key, entry in state.get("pending", {}).items()
+        if str(entry.get("record_id") or state_mod.parse_item_key(key)[0]) == record_id
+        and (
+            not akeneo_identifier
+            or str(entry.get("akeneo_identifier", "")).lower() == akeneo_identifier.lower()
+        )
+    ]
+    if not matching_keys and record_id in state.get("pending", {}):
+        # Fallback — legacy non-subform pending entry keyed by bare record_id.
+        matching_keys = [record_id]
+    for key in matching_keys:
+        state_mod.remove_pending(state, key)
     state_mod.mark_processed(
         state, record_id, request_type,
         final_status=config.STATUS_DONE,

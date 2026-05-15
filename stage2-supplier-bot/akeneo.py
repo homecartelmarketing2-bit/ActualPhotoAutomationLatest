@@ -202,12 +202,33 @@ def find_product_by_name(product_name: str) -> tuple[str, dict] | tuple[None, No
     return None, None
 
 
-def lookup_product(product_name: str) -> tuple[str, dict | None, bool, bytes | None]:
+def lookup_product(
+    product_name: str,
+    identifier_hint: str = "",
+) -> tuple[str, dict | None, bool, bytes | None]:
     """
     Single Akeneo lookup per product — called once in run.py per record.
     Returns: (akeneo_identifier, product_dict, has_actual_photo, catalog_photo_bytes)
+
+    ``identifier_hint`` (typically the SKU from the Zoho `Product_Name1`
+    subform row) is tried first as an exact identifier / product-model
+    code. This avoids an expensive name-based search when the SKU is
+    already known.
     """
-    identifier, product = find_product_by_name(product_name)
+    identifier: str = ""
+    product: dict | None = None
+
+    if identifier_hint:
+        identifier_hint = str(identifier_hint).strip()
+        if identifier_hint:
+            product = get_product_by_identifier(identifier_hint)
+            if not product:
+                product = get_product_model_by_code(identifier_hint)
+            if product:
+                identifier = identifier_hint
+
+    if not product:
+        identifier, product = find_product_by_name(product_name)
     if not product:
         log.info(f"Akeneo: product not found for '{product_name}'")
         return "", None, False, None
