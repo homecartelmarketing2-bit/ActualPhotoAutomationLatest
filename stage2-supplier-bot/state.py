@@ -1,22 +1,31 @@
 """
 Persistent JSON state for the HC SPEC bot.
 
+Pending entries are keyed by a composite "item key" so a single Zoho
+record with multiple `Product_Name1` subform rows tracks one entry per
+row. The composite key has the form "<record_id>::<row_id>". For rows
+with no row_id (legacy / non-subform records) the key falls back to the
+bare record_id.
+
 Schema:
 {
   "telegram_chat_id": -1001234567890,
   "telegram_update_offset": 0,
   "pending": {
-    "<record_id>": {
-      "sku": "10227P/11",
+    "<record_id>::<row_id>": {
+      "record_id": "<record_id>",
+      "row_id": "<row_id>",
+      "akeneo_identifier": "10227P/11",
       "product_name": "Tartarus | Chandelier",
       "sales_notes": "...",
+      "request_type": "Actual Photo",
       "telegram_message_id": 456,
       "sent_time": "2026-04-13T10:00:00",
       "last_sent_time": "2026-04-13T10:00:00"
     }
   },
   "message_to_record": {
-    "456": "<record_id>"
+    "456": "<record_id>::<row_id>"
   }
 }
 """
@@ -101,11 +110,40 @@ def set_chat_id(state: dict, chat_id: int):
     save(state)
 
 
+def make_item_key(record_id: str, row_id: str = "") -> str:
+    """Build a composite pending key from a Zoho record id + subform row id.
+
+    If row_id is empty/falsy, the bare record_id is returned (legacy /
+    non-subform records).
+    """
+    record_id = str(record_id)
+    row_id = str(row_id or "").strip()
+    if not row_id:
+        return record_id
+    return f"{record_id}::{row_id}"
+
+
+def parse_item_key(item_key: str) -> tuple[str, str]:
+    """Split a composite key back into (record_id, row_id).
+
+    For bare record-id keys, row_id is returned as an empty string.
+    """
+    if not item_key:
+        return "", ""
+    if "::" in item_key:
+        record_id, _, row_id = item_key.partition("::")
+        return record_id, row_id
+    return item_key, ""
+
+
 def add_pending(state: dict, record_id: str, product_name: str, sales_notes: str,
                 akeneo_identifier: str, message_id: int, sent_time: str,
-                request_type: str = ""):
+                request_type: str = "", row_id: str = ""):
+    key = make_item_key(record_id, row_id)
     with _lock:
-        state["pending"][record_id] = {
+        state["pending"][key] = {
+            "record_id":          str(record_id),
+            "row_id":             str(row_id or ""),
             "product_name":       product_name,
             "sales_notes":        sales_notes,
             "akeneo_identifier":  akeneo_identifier,   # Akeneo product id/code for uploads
@@ -114,48 +152,69 @@ def add_pending(state: dict, record_id: str, product_name: str, sales_notes: str
             "sent_time":          sent_time,
             "last_sent_time":     sent_time,
         }
-        state["message_to_record"][str(message_id)] = record_id
+        state["message_to_record"][str(message_id)] = key
     save(state)
 
 
-def remove_pending(state: dict, record_id: str):
+def remove_pending(state: dict, item_key: str):
     with _lock:
-        state["pending"].pop(record_id, None)
+        state["pending"].pop(item_key, None)
         stale_message_ids = [
             message_id
-            for message_id, mapped_record_id in state["message_to_record"].items()
-            if mapped_record_id == record_id
+            for message_id, mapped_key in state["message_to_record"].items()
+            if mapped_key == item_key
         ]
         for message_id in stale_message_ids:
             state["message_to_record"].pop(message_id, None)
     save(state)
 
 
-def register_message(state: dict, record_id: str, message_id: int, sent_time: str | None = None):
+def register_message(state: dict, item_key: str, message_id: int, sent_time: str | None = None):
     with _lock:
-        if record_id in state["pending"]:
-            state["pending"][record_id]["telegram_message_id"] = message_id
+        if item_key in state["pending"]:
+            state["pending"][item_key]["telegram_message_id"] = message_id
             if sent_time:
-                state["pending"][record_id]["last_sent_time"] = sent_time
-        state["message_to_record"][str(message_id)] = record_id
+                state["pending"][item_key]["last_sent_time"] = sent_time
+        state["message_to_record"][str(message_id)] = item_key
     save(state)
 
 
-def update_last_sent(state: dict, record_id: str, last_sent_time: str):
+def update_last_sent(state: dict, item_key: str, last_sent_time: str):
     with _lock:
-        if record_id in state["pending"]:
-            state["pending"][record_id]["last_sent_time"] = last_sent_time
+        if item_key in state["pending"]:
+            state["pending"][item_key]["last_sent_time"] = last_sent_time
     save(state)
 
 
 def record_id_for_message(state: dict, message_id: int) -> str | None:
+    """Return the composite item-key that owns this Telegram message_id."""
     with _lock:
         return state["message_to_record"].get(str(message_id))
 
 
-def is_pending(state: dict, record_id: str) -> bool:
+def is_pending(state: dict, item_key: str) -> bool:
+    """True if the exact composite item-key has a pending entry."""
     with _lock:
-        return record_id in state["pending"]
+        return item_key in state["pending"]
+
+
+def pending_items_for_record(state: dict, record_id: str) -> list[tuple[str, dict]]:
+    """Return every (item_key, entry) currently pending for this record."""
+    record_id = str(record_id)
+    with _lock:
+        results: list[tuple[str, dict]] = []
+        for key, entry in state["pending"].items():
+            entry_record_id = str(entry.get("record_id") or "")
+            if not entry_record_id:
+                # Legacy entry — composite key may be a bare record_id.
+                entry_record_id, _ = parse_item_key(key)
+            if entry_record_id == record_id:
+                results.append((key, entry))
+        return results
+
+
+def record_has_pending_items(state: dict, record_id: str) -> bool:
+    return bool(pending_items_for_record(state, record_id))
 
 
 def mark_invalid_record(

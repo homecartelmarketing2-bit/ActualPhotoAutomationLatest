@@ -201,17 +201,35 @@ def search_record_by_product_name(product_name: str) -> dict | None:
 
     target = product_name.lower().strip()
     for record in all_records:
-        # Check standard fields representing Product Name
-        rec_name = ""
-        for key in ("Product_Name", "Product_name", "product_name", "Name", "name"):
-            val = record.get(key)
-            if val and str(val).strip():
-                rec_name = str(val).lower().strip()
-                break
-        
-        if rec_name and (target == rec_name or target in rec_name or rec_name in target):
-            return record
-            
+        # Product info now always lives in the `Product_Name1` subform.
+        # Each row has `Items.Item_Name` (or `zc_display_value`) and an `SKU`.
+        rows = record.get("Product_Name1") or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            items_obj = row.get("Items") or {}
+            candidates: list[str] = []
+            if isinstance(items_obj, dict):
+                for key in ("Item_Name", "zc_display_value", "display_value", "Name"):
+                    val = items_obj.get(key)
+                    if val:
+                        candidates.append(str(val).lower().strip())
+            for key in ("zc_display_value", "display_value"):
+                val = row.get(key)
+                if val:
+                    candidates.append(str(val).lower().strip())
+            sku_val = row.get("SKU")
+            if sku_val:
+                candidates.append(str(sku_val).lower().strip())
+
+            for rec_name in candidates:
+                if not rec_name:
+                    continue
+                if target == rec_name or target in rec_name or rec_name in target:
+                    return record
+
     return None
 
 
