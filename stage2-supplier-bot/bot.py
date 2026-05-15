@@ -428,7 +428,7 @@ def _handle_text_reply(text: str, record_id: str, product_name: str,
 
         try:
             zoho.update_record(record_id, {
-                "Request_Status": "Done",
+                "Request_Status": "NOT AVAILABLE",
                 "Remarks_Notes": f"Supplier confirmed: Actual photo not available. ({translated})",
             })
         except Exception as exc:
