@@ -344,13 +344,14 @@ class TextReplyNotAvailableTests(unittest.TestCase):
         self.assertIn(self.config.FIELD_SUPPLIER_ACTUAL_PHOTO, upload_fields)
         self.assertNotIn("Actual_Photo1", upload_fields)
 
-        # Remarks must use the exact "This is automated na uploaded from supplier" string.
+        # For "Supplier Actual Photo" request_type, Remarks must use the
+        # supplier-specific phrasing.
         remarks = next(
             (u["fields"].get("Remarks_Notes", "") for u in zoho_updates if "Remarks_Notes" in u["fields"]),
             "",
         )
         self.assertTrue(
-            remarks.startswith("This is automated na uploaded from supplier"),
+            remarks.startswith("Automated Retrieval of Actual Photos/Videos from Supplier"),
             f"unexpected remarks: {remarks!r}",
         )
 
@@ -715,6 +716,247 @@ class TelegramCaptionTests(unittest.TestCase):
         self.assertIn("SKU: XR-B1029-1", caption)
         self.assertIn("Customer wants close-up of base", caption)
         self.assertNotIn("Rhosyn", caption)
+
+
+class SupplierActualPhotoRemarksTests(unittest.TestCase):
+    """
+    Per-request-type remarks behaviour:
+
+    - When the request_type is "Supplier Actual Photo", the Remarks/Notes
+      field inside the "Internal & Supplier's Actual Photo" section
+      (`Remarks_Notes`) must be wiped on first pickup, and then set to a
+      standardized message based on the final outcome:
+          - photo/video received → "Automated Retrieval ..."
+          - confirmed not available → "Actual photo is not available ..."
+    - For the regular "Actual Photo" request_type, the existing
+      "This is automated na uploaded from supplier" wording is preserved
+      (no regression).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+        for mod_name in ("run", "bot", "zoho", "akeneo"):
+            if mod_name in sys.modules:
+                del sys.modules[mod_name]
+        import bot
+        import run
+        self.bot = bot
+        self.run = run
+
+    # ── Reply handlers (bot.py) ──────────────────────────────────────────
+
+    def _capture_zoho_remarks(self, callable_with_state):
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        with mock.patch.object(self.bot.zoho, "upload_file", return_value={"code": 3000}), \
+             mock.patch.object(self.bot.zoho, "update_record", side_effect=fake_update_record), \
+             mock.patch.object(self.bot, "_send_text"), \
+             mock.patch.object(self.bot, "_download_file", return_value=b"bytes"), \
+             mock.patch.object(self.bot, "_load_placeholder_image", return_value=b"png"), \
+             mock.patch.object(self.bot.akeneo, "upload_actual_photo", return_value=True), \
+             mock.patch.object(self.bot.llm, "translate_to_english",
+                               side_effect=lambda t: t), \
+             mock.patch.object(self.bot.llm, "classify_unavailable",
+                               side_effect=lambda t: "wala" in t.lower()):
+            s = self.state.load()
+            callable_with_state(s)
+
+        for update in zoho_updates:
+            if "Remarks_Notes" in update["fields"]:
+                return update["fields"]["Remarks_Notes"]
+        return ""
+
+    def test_photo_reply_supplier_actual_photo_uses_new_remarks(self):
+        def run_handler(s):
+            self.state.add_pending(
+                s, "rec-sap-1", "Lamp", "", "SKU-SAP-1", 100,
+                sent_time="2026-01-01T00:00:00",
+                request_type="Supplier Actual Photo",
+            )
+            self.bot._handle_photo_reply(
+                {"photo": [{"file_id": "abc", "width": 800, "height": 600}]},
+                "rec-sap-1", "Lamp", "SKU-SAP-1", 1234, s,
+            )
+
+        remarks = self._capture_zoho_remarks(run_handler)
+        self.assertTrue(
+            remarks.startswith(
+                "Automated Retrieval of Actual Photos/Videos from Supplier"
+            ),
+            f"unexpected remarks: {remarks!r}",
+        )
+
+    def test_photo_reply_actual_photo_keeps_legacy_remarks(self):
+        """Regression guard — Path-2 records (Actual Photo type that fell
+        through to Stage 2) keep the original 'This is automated na
+        uploaded from supplier' phrasing.
+        """
+        def run_handler(s):
+            self.state.add_pending(
+                s, "rec-ap-1", "Lamp", "", "SKU-AP-1", 200,
+                sent_time="2026-01-01T00:00:00",
+                request_type="Actual Photo",
+            )
+            self.bot._handle_photo_reply(
+                {"photo": [{"file_id": "xyz", "width": 800, "height": 600}]},
+                "rec-ap-1", "Lamp", "SKU-AP-1", 1234, s,
+            )
+
+        remarks = self._capture_zoho_remarks(run_handler)
+        self.assertTrue(
+            remarks.startswith("This is automated na uploaded from supplier"),
+            f"unexpected remarks: {remarks!r}",
+        )
+
+    def test_video_reply_supplier_actual_photo_uses_new_remarks(self):
+        def run_handler(s):
+            self.state.add_pending(
+                s, "rec-sap-2", "Lamp", "", "SKU-SAP-2", 101,
+                sent_time="2026-01-01T00:00:00",
+                request_type="Supplier Actual Photo",
+            )
+            self.bot._handle_video_reply(
+                {"video": {"file_id": "vid", "mime_type": "video/mp4"}},
+                "rec-sap-2", "Lamp", "SKU-SAP-2", 1234, s,
+            )
+
+        remarks = self._capture_zoho_remarks(run_handler)
+        self.assertTrue(
+            remarks.startswith(
+                "Automated Retrieval of Actual Photos/Videos from Supplier"
+            ),
+            f"unexpected remarks: {remarks!r}",
+        )
+
+    def test_not_available_reply_supplier_actual_photo_uses_new_remarks(self):
+        def run_handler(s):
+            self.state.add_pending(
+                s, "rec-sap-3", "Lamp", "", "SKU-SAP-3", 102,
+                sent_time="2026-01-01T00:00:00",
+                request_type="Supplier Actual Photo",
+            )
+            self.bot._handle_text_reply(
+                "wala po", "rec-sap-3", "Lamp", "SKU-SAP-3", 1234, s,
+            )
+
+        remarks = self._capture_zoho_remarks(run_handler)
+        self.assertTrue(
+            remarks.startswith("Actual photo is not available from the supplier"),
+            f"unexpected remarks: {remarks!r}",
+        )
+        self.assertIn("Generated Actual Photo", remarks)
+
+    def test_not_available_reply_actual_photo_keeps_legacy_remarks(self):
+        """Regression guard — Path-2 not-available replies keep the
+        existing free-form 'Supplier confirmed: ...' phrasing so the
+        translated reason is preserved in Remarks.
+        """
+        def run_handler(s):
+            self.state.add_pending(
+                s, "rec-ap-3", "Lamp", "", "SKU-AP-3", 202,
+                sent_time="2026-01-01T00:00:00",
+                request_type="Actual Photo",
+            )
+            self.bot._handle_text_reply(
+                "wala po", "rec-ap-3", "Lamp", "SKU-AP-3", 1234, s,
+            )
+
+        remarks = self._capture_zoho_remarks(run_handler)
+        self.assertTrue(
+            remarks.startswith("Supplier confirmed: Actual photo not available"),
+            f"unexpected remarks: {remarks!r}",
+        )
+
+    # ── Poller wipe (run.py) ────────────────────────────────────────────
+
+    def _supplier_actual_photo_record(self) -> dict:
+        return {
+            "ID": "rec-sap-wipe",
+            "Type_of_Request": "Supplier Actual Photo",
+            "Request_Status": "Pending",
+            "Remarks_Notes": "stale text from previous stage",
+            "Product_Name": "",
+            "Product_Name1": [
+                {
+                    "ID": "row-1",
+                    "Items": {"Item_Name": "Lamp"},
+                    "SKU": "SKU-SAP-1",
+                },
+            ],
+        }
+
+    def _run_poll(self, record: dict):
+        """Drive run._poll_once with stubbed Zoho/Telegram so we can
+        capture what update_record was called with.
+        """
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        with mock.patch.object(self.run.zoho, "get_pending_records", return_value=[record]), \
+             mock.patch.object(self.run.zoho, "update_record", side_effect=fake_update_record), \
+             mock.patch.object(self.run.akeneo, "lookup_product",
+                               return_value=("SKU-SAP-1", {}, False, b"jpg")), \
+             mock.patch.object(self.run.bot, "send_photo_request", return_value=999), \
+             mock.patch.object(self.run.state_mod, "get_chat_id", return_value=-12345):
+            s = self.state.load()
+            self.run._poll_once(s)
+        return zoho_updates
+
+    def test_poller_wipes_remarks_on_first_pickup_for_supplier_actual_photo(self):
+        zoho_updates = self._run_poll(self._supplier_actual_photo_record())
+        # The first update for this record should clear Remarks_Notes;
+        # the second update (after sending Telegram) sets Status=In progress.
+        wipe_updates = [
+            u for u in zoho_updates
+            if u["record_id"] == "rec-sap-wipe"
+            and u["fields"].get("Remarks_Notes") == ""
+        ]
+        self.assertEqual(
+            len(wipe_updates), 1,
+            f"expected exactly one Remarks_Notes wipe; got: {zoho_updates}",
+        )
+
+    def test_poller_does_not_wipe_remarks_on_second_pickup(self):
+        # First poll: seeds a pending entry for the record.
+        self._run_poll(self._supplier_actual_photo_record())
+        # Second poll: same record. record_has_pending_items() returns True
+        # now so we must NOT wipe again.
+        record_after = self._supplier_actual_photo_record()
+        record_after["Request_Status"] = "In progress"
+        zoho_updates = self._run_poll(record_after)
+        wipe_updates = [
+            u for u in zoho_updates
+            if u["record_id"] == "rec-sap-wipe"
+            and u["fields"].get("Remarks_Notes") == ""
+        ]
+        self.assertEqual(
+            wipe_updates, [],
+            f"unexpected re-wipe on second poll: {zoho_updates}",
+        )
+
+    def test_poller_does_not_wipe_remarks_for_actual_photo_type(self):
+        record = self._supplier_actual_photo_record()
+        record["Type_of_Request"] = "Actual Photo"
+        record["Remarks_Notes"] = self.config.TRIGGER_TEXT
+        zoho_updates = self._run_poll(record)
+        wipe_updates = [
+            u for u in zoho_updates
+            if u["record_id"] == "rec-sap-wipe"
+            and u["fields"].get("Remarks_Notes") == ""
+        ]
+        self.assertEqual(
+            wipe_updates, [],
+            f"Actual Photo type must not wipe Remarks; got: {zoho_updates}",
+        )
 
 
 if __name__ == "__main__":

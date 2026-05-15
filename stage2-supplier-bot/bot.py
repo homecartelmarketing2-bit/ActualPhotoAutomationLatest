@@ -362,7 +362,7 @@ def _handle_photo_reply(message: dict, item_key: str, product_name: str,
         except Exception as exc:
             log.error(f"Akeneo upload failed for {akeneo_identifier}: {exc}")
 
-    notes = config.REMARKS_AUTOMATED_FROM_SUPPLIER
+    notes = _remarks_for_received(request_type)
     if not success_zoho:
         notes += " (Zoho upload failed — manual check needed)"
     if akeneo_identifier and not success_akeneo:
@@ -422,7 +422,7 @@ def _handle_video_reply(message: dict, item_key: str, product_name: str,
 
     # Per user request, do not upload videos to Akeneo
 
-    notes = config.REMARKS_AUTOMATED_FROM_SUPPLIER
+    notes = _remarks_for_received(request_type)
     if not success_zoho:
         notes += " (Zoho upload failed)"
 
@@ -478,7 +478,7 @@ def _handle_text_reply(text: str, item_key: str, product_name: str,
             state, record_id, request_type,
             product_name=product_name,
             akeneo_identifier=akeneo_identifier,
-            remarks=f"Supplier confirmed: Actual photo not available. ({translated})",
+            remarks=_remarks_for_not_available(request_type, translated),
             final_status=config.STATUS_NOT_AVAILABLE,
         )
         _send_text(chat_id,
@@ -497,6 +497,32 @@ def _handle_text_reply(text: str, item_key: str, product_name: str,
     )
     _send_text(chat_id, f"Thank you Tony! Your response for '{product_name}' has been recorded:\n{translated}")
     _send_text(config.TELEGRAM_ADMIN_ID, f"📝 *Response Recorded*\nSKU: {akeneo_identifier}\nName: {product_name}\nResponse: {translated}")
+
+
+def _remarks_for_received(request_type: str) -> str:
+    """Pick the Remarks_Notes base text to write when the supplier responds
+    with a photo or video upload.
+
+    "Supplier Actual Photo" requests use a distinct phrasing per user
+    request — "Actual Photo" (Stage 1 fall-through) keeps the original.
+    """
+    if request_type == config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO:
+        return config.REMARKS_SUPPLIER_PHOTO_RECEIVED
+    return config.REMARKS_AUTOMATED_FROM_SUPPLIER
+
+
+def _remarks_for_not_available(request_type: str, translated: str) -> str:
+    """Pick the Remarks_Notes text to write when the supplier confirms the
+    photo is not available.
+
+    For "Supplier Actual Photo", we use the standardized message that also
+    tells the user how to escalate to a Generated Actual Photo.
+    For other request types, keep the existing free-form text so the
+    supplier's translated reason is preserved.
+    """
+    if request_type == config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO:
+        return config.REMARKS_SUPPLIER_NOT_AVAILABLE
+    return f"Supplier confirmed: Actual photo not available. ({translated})"
 
 
 def _finalize_record_if_last_item(
