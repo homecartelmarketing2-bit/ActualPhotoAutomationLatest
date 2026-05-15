@@ -251,24 +251,66 @@ def get_catalog_photo_bytes(product_name: str) -> tuple[bytes | None, str]:
     return catalog_bytes, identifier
 
 
+def _first_empty_actual_photo_slot(identifier: str, slots: list[str]) -> str | None:
+    """
+    Look up the product in Akeneo and return the first slot in `slots` that
+    has no data. If we can't look up the product, fall back to the first
+    slot (legacy behavior). If all slots are filled, return None.
+    """
+    if not slots:
+        return None
+
+    product = get_product_by_identifier(identifier) or get_product_model_by_code(identifier)
+    if not product:
+        # We can't tell which slot is empty — fall back to slot 0.
+        log.info(
+            f"Akeneo: could not look up product '{identifier}' to find empty "
+            f"slot; defaulting to '{slots[0]}'."
+        )
+        return slots[0]
+
+    values = product.get("values", {})
+    for slot in slots:
+        entries = values.get(slot, [])
+        if not any(e.get("data") for e in entries):
+            return slot
+
+    return None  # all slots filled
+
+
 def upload_actual_photo(identifier: str, file_bytes: bytes, filename: str = "actual_photo.jpg") -> bool:
     """
-    Upload file_bytes as the Actual_Photo for the product in Akeneo.
+    Upload file_bytes as an Actual Photo for the product in Akeneo.
     identifier: the Akeneo product identifier or product-model code.
-    Step 1: POST /media-files to get the new media code.
-    Step 2: PATCH /products/{identifier} to link the media file.
-    Returns True on success.
+
+    Behavior:
+    - The product has up to N "actual photo" slots, configured via
+      config.AKENEO_PHOTO_ATTRIBUTES (default
+      ["Actual_Photo", "another_picture_5", "another_picture_6"], i.e.
+      "Actual Photo / Actual Photo 2 / Actual Photo 3" in the UI).
+    - We upload to the FIRST empty slot. If all slots are filled we
+      overwrite the first slot (Actual_Photo) so the latest supplier
+      photo always wins. This matches what sales expects: the photo
+      from the request always ends up in the product page.
     """
     if not identifier:
         log.warning("Akeneo upload_actual_photo: no identifier provided, skipping.")
         return False
 
+    slots = list(config.AKENEO_PHOTO_ATTRIBUTES) or [config.AKENEO_ACTUAL_ATTR]
+    target_slot = _first_empty_actual_photo_slot(identifier, slots)
+    if target_slot is None:
+        target_slot = slots[0]
+        log.info(
+            f"Akeneo: all {len(slots)} actual-photo slots filled for "
+            f"'{identifier}'; overwriting '{target_slot}' with new upload."
+        )
+
     token = _authenticate()
 
-    # Step 1: upload the media file
     product_data = json.dumps({
         "identifier": identifier,
-        "attribute":  config.AKENEO_ACTUAL_ATTR,
+        "attribute":  target_slot,
         "locale":     None,
         "scope":      None,
     })
@@ -283,24 +325,31 @@ def upload_actual_photo(identifier: str, file_bytes: bytes, filename: str = "act
     )
     if not upload_resp.ok:
         if upload_resp.status_code == 422 and "not in the attribute set" in upload_resp.text:
-            log.warning(f"Akeneo upload_actual_photo skipped: {config.AKENEO_ACTUAL_ATTR} is not in the attribute set for '{identifier}'.")
+            log.warning(
+                f"Akeneo upload_actual_photo skipped: '{target_slot}' is not "
+                f"in the attribute set for '{identifier}'."
+            )
             return False
-        log.error(f"Akeneo upload_actual_photo failed: {upload_resp.status_code} {upload_resp.text[:300]}")
+        log.error(
+            f"Akeneo upload_actual_photo failed ({target_slot}): "
+            f"{upload_resp.status_code} {upload_resp.text[:300]}"
+        )
         return False
 
-    # The media code is returned in the Location header or response body
     media_code = None
     location = upload_resp.headers.get("Location", "")
     if location:
         media_code = location.rstrip("/").split("/")[-1]
     else:
-        # Some versions return it in the body
         try:
             media_code = upload_resp.json().get("code")
         except Exception:
             pass
 
-    log.info(f"Akeneo: uploaded actual photo for {identifier} OK (media code: {media_code}).")
+    log.info(
+        f"Akeneo: uploaded actual photo for '{identifier}' to slot "
+        f"'{target_slot}' (media code: {media_code})."
+    )
     return True
 
 

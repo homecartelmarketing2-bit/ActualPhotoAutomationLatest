@@ -45,11 +45,13 @@ def _reload_modules(state_file: str):
 
 
 class _FakeResp:
-    def __init__(self, data, ok=True, status=200, text=""):
+    def __init__(self, data, ok=True, status=200, text="", headers=None):
         self._data = data
         self.ok = ok
         self.status_code = status
         self.text = text
+        self.headers = headers or {}
+        self.content = b""
 
     def raise_for_status(self):
         if not self.ok:
@@ -362,6 +364,75 @@ class TextReplyNotAvailableTests(unittest.TestCase):
             u["fields"].get("Request_Status") for u in zoho_updates if "Request_Status" in u["fields"]
         ]
         self.assertEqual(status_updates, [self.config.STATUS_DONE])
+
+
+class AkeneoSlotSelectionTests(unittest.TestCase):
+    """upload_actual_photo must pick the first empty actual-photo slot."""
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        for mod_name in ("akeneo", "config"):
+            if mod_name in sys.modules:
+                del sys.modules[mod_name]
+        import importlib
+        self.config = importlib.import_module("config")
+        self.akeneo = importlib.import_module("akeneo")
+
+    def _make_product(self, filled_slots: list[str]) -> dict:
+        return {
+            "values": {
+                slot: [{"data": "media-code-xxx", "scope": None, "locale": None}]
+                for slot in filled_slots
+            },
+        }
+
+    def test_picks_first_slot_when_all_empty(self):
+        slots = ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        with mock.patch.object(self.akeneo, "get_product_by_identifier",
+                               return_value=self._make_product([])):
+            self.assertEqual(
+                self.akeneo._first_empty_actual_photo_slot("sku-1", slots),
+                "Actual_Photo",
+            )
+
+    def test_picks_next_empty_slot(self):
+        slots = ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        with mock.patch.object(self.akeneo, "get_product_by_identifier",
+                               return_value=self._make_product(["Actual_Photo"])):
+            self.assertEqual(
+                self.akeneo._first_empty_actual_photo_slot("sku-1", slots),
+                "another_picture_5",
+            )
+
+    def test_returns_none_when_all_filled(self):
+        slots = ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        with mock.patch.object(self.akeneo, "get_product_by_identifier",
+                               return_value=self._make_product(slots)):
+            self.assertIsNone(
+                self.akeneo._first_empty_actual_photo_slot("sku-1", slots),
+            )
+
+    def test_upload_actual_photo_sends_to_first_empty_slot(self):
+        """Verify upload_actual_photo posts to Akeneo with the right slot name."""
+        captured: dict = {}
+
+        def fake_post(url, headers=None, files=None, timeout=None):
+            # Pull out the JSON product blob that names the attribute.
+            blob = files["product"][1]
+            captured["url"] = url
+            captured["attribute"] = __import__("json").loads(blob)["attribute"]
+            return _FakeResp({"code": "media-abc"}, ok=True, status=201)
+
+        slots = ["Actual_Photo", "another_picture_5", "another_picture_6"]
+        with mock.patch.object(self.akeneo, "_authenticate", return_value="tok"), \
+             mock.patch.object(self.akeneo, "get_product_by_identifier",
+                               return_value=self._make_product(["Actual_Photo"])), \
+             mock.patch.object(self.akeneo._session, "post", side_effect=fake_post), \
+             mock.patch.object(self.config, "AKENEO_PHOTO_ATTRIBUTES", slots):
+            ok = self.akeneo.upload_actual_photo("sku-1", b"jpgbytes")
+
+        self.assertTrue(ok)
+        self.assertEqual(captured.get("attribute"), "another_picture_5")
 
 
 if __name__ == "__main__":
