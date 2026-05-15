@@ -168,6 +168,46 @@ class GetPendingRecordsTests(unittest.TestCase):
             "Expected one query for Supplier Actual Photo with NO status filter",
         )
 
+    def test_any_status_query_400_is_tolerated_and_does_not_block_actual_photo(self):
+        """If the Supplier Actual Photo query returns 400 (e.g. value not yet
+        in the Zoho dropdown), the Actual Photo results must still come
+        through — we don't want a single bad criteria to blank the poll.
+        """
+        actual_photo_records = [
+            {
+                "ID": "10",
+                "Type_of_Request": "Actual Photo",
+                "Request_Status": "Pending",
+                "Remarks_Notes": f"x {self.config.TRIGGER_TEXT} y",
+                "Product_Name": "Lamp",
+            },
+        ]
+
+        def fake_get(url, headers=None, params=None, timeout=None):
+            criteria = params["criteria"]
+            if "Supplier Actual Photo" in criteria and "Request_Status" not in criteria:
+                # Simulate Zoho's "value not in dropdown" 400.
+                return _FakeResp(
+                    {}, ok=False, status=400,
+                    text='{"code":3001,"description":"Invalid criteria"}',
+                )
+            if "Actual Photo" in criteria and "Request_Status" in criteria:
+                return _FakeResp({"data": actual_photo_records})
+            return _FakeResp({"data": []})
+
+        with mock.patch.object(self.zoho.requests, "get", side_effect=fake_get), \
+             mock.patch.object(
+                 self.zoho._auth, "headers", return_value={"Authorization": "x"}
+             ):
+            result = self.zoho.get_pending_records()
+
+        ids = [str(r.get("ID")) for r in result]
+        self.assertIn(
+            "10", ids,
+            "Actual Photo record must still be returned even if the "
+            "second Supplier-Actual-Photo query 400s",
+        )
+
 
 class ProcessedRecordsStateTests(unittest.TestCase):
     def setUp(self):
