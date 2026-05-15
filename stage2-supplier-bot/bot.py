@@ -149,19 +149,21 @@ def resend_request(chat_id: int, record_id: str, entry: dict) -> int | None:
 
 def _build_caption(product_name: str, akeneo_identifier: str, sales_notes: str,
                    is_followup: bool = False) -> str:
+    # NOTE: `product_name` is intentionally not shown in the caption — the
+    # supplier identifies the item by SKU only (see user request).
+    del product_name
     lines = []
     if is_followup:
         lines.extend(["Follow-up reminder:", ""])
 
-    lines.append(f"Name: {product_name}")
     lines.append(f"SKU: {akeneo_identifier}")
-    
-    # Only include sales notes if it's an actual manual request, 
+
+    # Only include sales notes if it's an actual manual request,
     # not the auto-generated "No matching photo/video found" text.
     if sales_notes and "No matching photo/video found" not in sales_notes:
         lines.append("")  # blank line
         lines.append(sales_notes)
-        
+
     lines.append("")  # blank line separator
     lines.append("Can you please provide an actual photo for this item")
     return "\n".join(lines)

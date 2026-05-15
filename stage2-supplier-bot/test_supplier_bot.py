@@ -665,5 +665,57 @@ class StateCompositeKeyTests(unittest.TestCase):
         self.assertTrue(self.state.record_has_pending_items(s, "rec-2"))
 
 
+class TelegramCaptionTests(unittest.TestCase):
+    """The supplier-facing Telegram caption must show the SKU only —
+    the product name is intentionally omitted (user request).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+        if "bot" in sys.modules:
+            del sys.modules["bot"]
+        import bot
+        self.bot = bot
+
+    def test_caption_includes_sku_but_not_name(self):
+        caption = self.bot._build_caption(
+            "Rhosyn | Alabaster Wall Light",
+            "XR-B1029-1",
+            "",
+        )
+        self.assertIn("SKU: XR-B1029-1", caption)
+        self.assertNotIn("Rhosyn", caption)
+        self.assertNotIn("Alabaster", caption)
+        self.assertNotIn("Name:", caption)
+        # The ask line still comes through.
+        self.assertIn("Can you please provide an actual photo for this item", caption)
+
+    def test_followup_caption_also_omits_name(self):
+        caption = self.bot._build_caption(
+            "Rhosyn | Alabaster Wall Light",
+            "XR-B1029-1",
+            "",
+            is_followup=True,
+        )
+        self.assertTrue(caption.startswith("Follow-up reminder:"))
+        self.assertIn("SKU: XR-B1029-1", caption)
+        self.assertNotIn("Rhosyn", caption)
+        self.assertNotIn("Name:", caption)
+
+    def test_caption_includes_sales_notes_when_present(self):
+        caption = self.bot._build_caption(
+            "Rhosyn | Alabaster Wall Light",
+            "XR-B1029-1",
+            "Customer wants close-up of base",
+        )
+        self.assertIn("SKU: XR-B1029-1", caption)
+        self.assertIn("Customer wants close-up of base", caption)
+        self.assertNotIn("Rhosyn", caption)
+
+
 if __name__ == "__main__":
     unittest.main()
