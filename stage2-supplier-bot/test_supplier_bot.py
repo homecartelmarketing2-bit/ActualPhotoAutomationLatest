@@ -262,11 +262,11 @@ class TextReplyNotAvailableTests(unittest.TestCase):
         self.assertIn(self.config.STATUS_NOT_AVAILABLE, status_updates)
         self.assertNotIn(self.config.STATUS_DONE, status_updates)
 
-        # Placeholder image must land in the Internal Actual Photo field
-        # (not the legacy Actual_Photo1 field).
+        # Placeholder image must land in the configured "Internal Actual Photo"
+        # field (in this form that's still the legacy Actual_Photo1 API name,
+        # because Zoho keeps the link name when a field is renamed in the UI).
         upload_fields = [u["field"] for u in uploads]
         self.assertIn(self.config.FIELD_INTERNAL_ACTUAL_PHOTO, upload_fields)
-        self.assertNotIn("Actual_Photo1", upload_fields)
 
         # And the record must be marked processed so the poller doesn't re-send.
         s_after = self.state.load()

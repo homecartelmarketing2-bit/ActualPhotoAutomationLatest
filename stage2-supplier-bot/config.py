@@ -133,25 +133,26 @@ REMARKS_AUTOMATED_FROM_SUPPLIER = os.environ.get(
 )
 
 # ── Zoho field names for upload destinations ─────────────────────────────────
-# These are the API names (not the UI display names). They follow Zoho
-# Creator's apostrophe convention (e.g. UI "Checker's Note" → API
-# "Checker_s_Note"). They can be overridden via env vars if Zoho's API names
-# differ from the defaults below.
+# These are the API (link) names — not the UI display names. They were
+# verified against the live form via the file-upload probe endpoint, so the
+# defaults below match what's currently in the Zoho Encoding Request form.
+# They remain env-overridable in case the form is re-shaped later.
 #
-#   Supplier_s_Actual_Photo  ← UI "Supplier's Actual Photo"
-#   Internal_Actual_Photo    ← UI "Internal Actual Photo"
-#   Internal_Actual_Video    ← UI "Internal Actual Video"
+#   UI label                  →  API name
+#   ───────────────────────       ─────────────────────────
+#   "Supplier's Actual Photo" →  Supplier_s_Actual_Photo1
+#   "Internal Actual Photo"   →  Actual_Photo1  (legacy name kept after UI rename)
+#   "Internal Actual Video"   →  Internal_Actual_Video
 FIELD_SUPPLIER_ACTUAL_PHOTO = os.environ.get(
-    "FIELD_SUPPLIER_ACTUAL_PHOTO", "Supplier_s_Actual_Photo"
+    "FIELD_SUPPLIER_ACTUAL_PHOTO", "Supplier_s_Actual_Photo1"
 )
 FIELD_INTERNAL_ACTUAL_PHOTO = os.environ.get(
-    "FIELD_INTERNAL_ACTUAL_PHOTO", "Internal_Actual_Photo"
+    "FIELD_INTERNAL_ACTUAL_PHOTO", "Actual_Photo1"
 )
 FIELD_INTERNAL_ACTUAL_VIDEO = os.environ.get(
     "FIELD_INTERNAL_ACTUAL_VIDEO", "Internal_Actual_Video"
 )
-# Legacy fields that the bot used before "Internal & Supplier's Actual Photo"
-# was added to the form. Kept as fallbacks so existing records still work.
+# Legacy field names kept for reference / backward-compat env overrides.
 FIELD_LEGACY_ACTUAL_PHOTO = os.environ.get("FIELD_LEGACY_ACTUAL_PHOTO", "Actual_Photo1")
 FIELD_LEGACY_VIDEO        = os.environ.get("FIELD_LEGACY_VIDEO",        "Video")
 
