@@ -503,10 +503,15 @@ def _remarks_for_received(request_type: str) -> str:
     """Pick the Remarks_Notes base text to write when the supplier responds
     with a photo or video upload.
 
-    "Supplier Actual Photo" requests use a distinct phrasing per user
-    request — "Actual Photo" (Stage 1 fall-through) keeps the original.
+    Both "Supplier Actual Photo" and the "Actual Photo" fall-through path
+    end with Tony uploading a photo, so they share the same canonical
+    text. ``REMARKS_AUTOMATED_FROM_SUPPLIER`` is kept for backwards
+    compatibility if anyone has overridden it via env var.
     """
-    if request_type == config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO:
+    if request_type in (
+        config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+        config.REQUEST_TYPE_ACTUAL_PHOTO,
+    ):
         return config.REMARKS_SUPPLIER_PHOTO_RECEIVED
     return config.REMARKS_AUTOMATED_FROM_SUPPLIER
 
@@ -515,13 +520,17 @@ def _remarks_for_not_available(request_type: str, translated: str) -> str:
     """Pick the Remarks_Notes text to write when the supplier confirms the
     photo is not available.
 
-    For "Supplier Actual Photo", we use the standardized message that also
-    tells the user how to escalate to a Generated Actual Photo.
-    For other request types, keep the existing free-form text so the
-    supplier's translated reason is preserved.
+    Both supplier-bound paths use the standardized message that tells the
+    user how to escalate to a Generated Actual Photo, and append Tony's
+    translated reply as supplementary context so the reason isn't lost.
     """
-    if request_type == config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO:
-        return config.REMARKS_SUPPLIER_NOT_AVAILABLE
+    if request_type in (
+        config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+        config.REQUEST_TYPE_ACTUAL_PHOTO,
+    ):
+        base = config.REMARKS_SUPPLIER_NOT_AVAILABLE
+        suffix = f" (Tony's reply: {translated})" if translated else ""
+        return f"{base}{suffix}"
     return f"Supplier confirmed: Actual photo not available. ({translated})"
 
 

@@ -720,17 +720,18 @@ class TelegramCaptionTests(unittest.TestCase):
 
 class SupplierActualPhotoRemarksTests(unittest.TestCase):
     """
-    Per-request-type remarks behaviour:
+    Unified remarks behaviour for both supplier-bound paths:
 
-    - When the request_type is "Supplier Actual Photo", the Remarks/Notes
-      field inside the "Internal & Supplier's Actual Photo" section
-      (`Remarks_Notes`) must be wiped on first pickup, and then set to a
-      standardized message based on the final outcome:
-          - photo/video received → "Automated Retrieval ..."
-          - confirmed not available → "Actual photo is not available ..."
-    - For the regular "Actual Photo" request_type, the existing
-      "This is automated na uploaded from supplier" wording is preserved
-      (no regression).
+    - "Supplier Actual Photo" (Sales directly routes to supplier)
+    - "Actual Photo" (Stage 1 fell through; Stage 2 escalates to supplier)
+
+    For both, the Remarks/Notes field inside the "Internal & Supplier's
+    Actual Photo" section (`Remarks_Notes`) must be wiped on first
+    pickup, and then set to a standardized message based on the final
+    outcome:
+        - photo/video received → "Automated Retrieval ..."
+        - confirmed not available → "Actual photo is not available ...
+          (Tony's reply: <translated>)"
     """
 
     def setUp(self):
@@ -793,10 +794,10 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
             f"unexpected remarks: {remarks!r}",
         )
 
-    def test_photo_reply_actual_photo_keeps_legacy_remarks(self):
-        """Regression guard — Path-2 records (Actual Photo type that fell
-        through to Stage 2) keep the original 'This is automated na
-        uploaded from supplier' phrasing.
+    def test_photo_reply_actual_photo_uses_new_remarks(self):
+        """Path-2 records (Actual Photo type that fell through to Stage 2)
+        also use the standardized supplier text, since the actual photo
+        ultimately came from the supplier via Telegram.
         """
         def run_handler(s):
             self.state.add_pending(
@@ -811,7 +812,9 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
 
         remarks = self._capture_zoho_remarks(run_handler)
         self.assertTrue(
-            remarks.startswith("This is automated na uploaded from supplier"),
+            remarks.startswith(
+                "Automated Retrieval of Actual Photos/Videos from Supplier"
+            ),
             f"unexpected remarks: {remarks!r}",
         )
 
@@ -853,10 +856,10 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
         )
         self.assertIn("Generated Actual Photo", remarks)
 
-    def test_not_available_reply_actual_photo_keeps_legacy_remarks(self):
-        """Regression guard — Path-2 not-available replies keep the
-        existing free-form 'Supplier confirmed: ...' phrasing so the
-        translated reason is preserved in Remarks.
+    def test_not_available_reply_actual_photo_uses_new_remarks(self):
+        """Path-2 not-available replies use the standardized supplier text
+        too. Tony's translated reply is appended in parens so the
+        original reason isn't lost.
         """
         def run_handler(s):
             self.state.add_pending(
@@ -870,9 +873,15 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
 
         remarks = self._capture_zoho_remarks(run_handler)
         self.assertTrue(
-            remarks.startswith("Supplier confirmed: Actual photo not available"),
+            remarks.startswith(
+                "Actual photo is not available from the supplier"
+            ),
             f"unexpected remarks: {remarks!r}",
         )
+        self.assertIn("Generated Actual Photo", remarks)
+        # Translated reason appended so context isn't lost.
+        self.assertIn("Tony's reply:", remarks)
+        self.assertIn("wala po", remarks)
 
     # ── Poller wipe (run.py) ────────────────────────────────────────────
 
@@ -943,10 +952,15 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
             f"unexpected re-wipe on second poll: {zoho_updates}",
         )
 
-    def test_poller_does_not_wipe_remarks_for_actual_photo_type(self):
+    def test_poller_wipes_remarks_on_first_pickup_for_actual_photo_type(self):
+        """"Actual Photo" records that fell through to Stage 2 (i.e., Stage
+        1 left the trigger text in Remarks_Notes2) ALSO have their
+        Remarks_Notes field wiped on first pickup so the final
+        supplier-outcome text is the only thing in the field.
+        """
         record = self._supplier_actual_photo_record()
         record["Type_of_Request"] = "Actual Photo"
-        record["Remarks_Notes"] = self.config.TRIGGER_TEXT
+        record["Remarks_Notes"] = "stale text from previous run"
         zoho_updates = self._run_poll(record)
         wipe_updates = [
             u for u in zoho_updates
@@ -954,8 +968,9 @@ class SupplierActualPhotoRemarksTests(unittest.TestCase):
             and u["fields"].get("Remarks_Notes") == ""
         ]
         self.assertEqual(
-            wipe_updates, [],
-            f"Actual Photo type must not wipe Remarks; got: {zoho_updates}",
+            len(wipe_updates), 1,
+            f"expected exactly one Remarks_Notes wipe for Actual Photo type; "
+            f"got: {zoho_updates}",
         )
 
 
