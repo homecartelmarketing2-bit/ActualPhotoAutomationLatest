@@ -172,27 +172,32 @@ def _poll_once(state: dict):
             f"Status={current_status!r}  Items={len(subform_items)}"
         )
 
-        # For "Supplier Actual Photo" records, the previous Remarks/Notes
-        # (e.g. stale Stage-1 output, prior supplier responses) must be cleared
-        # on first pickup so the new outcome text is the only thing in the
-        # field. Gated on "no items pending yet for this record" so we only
-        # wipe once per record, not on every poll while we're waiting for
-        # Tony's replies.
+        # The previous Remarks/Notes (e.g. stale Stage-1 trigger output,
+        # prior supplier responses) must be cleared on first pickup so the
+        # new outcome text is the only thing in the field. This applies to
+        # both supplier-bound paths ("Supplier Actual Photo" and the
+        # "Actual Photo" fall-through after Stage 1 found nothing). Gated
+        # on "no items pending yet for this record" so we only wipe once
+        # per record, not on every poll while we're waiting for Tony's
+        # replies.
         if (
-            request_type == config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO
+            request_type in (
+                config.REQUEST_TYPE_SUPPLIER_ACTUAL_PHOTO,
+                config.REQUEST_TYPE_ACTUAL_PHOTO,
+            )
             and not state_mod.record_has_pending_items(state, record_id)
         ):
             if _dry_run:
                 log.info(
                     f"  [dry-run] Would clear Remarks_Notes on Zoho record "
-                    f"{record_id} (Supplier Actual Photo first pickup)"
+                    f"{record_id} ({request_type} first pickup)"
                 )
             else:
                 try:
                     zoho.update_record(record_id, {"Remarks_Notes": ""})
                     log.info(
                         f"  Cleared Remarks_Notes on record {record_id} "
-                        f"(Supplier Actual Photo first pickup)"
+                        f"({request_type} first pickup)"
                     )
                 except Exception as exc:
                     log.warning(
