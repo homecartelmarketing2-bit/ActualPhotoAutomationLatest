@@ -18,14 +18,24 @@ try:
     from .auth import ZohoAuth
     from .config import configure_logging, load_config
     from .creator import ZohoCreator
-    from .helpers import creator_criteria_value, extract_record_id, scalar_to_text
+    from .helpers import (
+        creator_criteria_value,
+        extract_record_id,
+        extract_subform_items,
+        scalar_to_text,
+    )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from akeneo import AkeneoClient
     from auth import ZohoAuth
     from config import configure_logging, load_config
     from creator import ZohoCreator
-    from helpers import creator_criteria_value, extract_record_id, scalar_to_text
+    from helpers import (
+        creator_criteria_value,
+        extract_record_id,
+        extract_subform_items,
+        scalar_to_text,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +191,8 @@ def process_records(
     records = creator.get_records(crm_app, encoding_report, criteria=criteria, max_records=max_fetch)
     logger.info("Fetched %d records from Zoho Creator", len(records))
 
+    subform_field = config.get("field_product_subform", "Product_Name1")
+
     for record in records:
         if limit and counts["processed"] >= limit:
             break
@@ -191,160 +203,221 @@ def process_records(
             logger.warning("Skipping record without ID: %s", record)
             continue
 
-        # Skip already processed
-        if record_id in state.get("uploaded", {}):
-            continue
-
-        product_name = scalar_to_text(record.get(config["field_product_name"]))
-        if not product_name:
-            logger.debug("Skipping record %s: no product name", record_id)
-            continue
-
         request_type = scalar_to_text(record.get(field_request_type))
         if request_type != request_type_value:
             logger.debug(
-                "Skipping record %s (%s): request type '%s' is not eligible",
-                record_id,
-                product_name,
-                request_type,
+                "Skipping record %s: request type '%s' is not eligible",
+                record_id, request_type,
             )
             continue
 
-        # Apply product filter
-        if product_filter and product_filter.lower() not in product_name.lower():
-            continue
+        # Production records carry per-item product data in the
+        # `Product_Name1` subform. We treat each row as a separate Akeneo
+        # upload target (by SKU first, falling back to product name).
+        # For legacy records without a subform we keep the original
+        # single-product behavior.
+        items = extract_subform_items(record, subform_field)
+        if not items:
+            top_level = scalar_to_text(record.get(config["field_product_name"]))
+            if top_level:
+                items = [{"item_id": "", "product_name": top_level, "sku": ""}]
+            else:
+                logger.debug(
+                    "Skipping record %s: no product_name and no subform items",
+                    record_id,
+                )
+                continue
 
-        # Check Actual_Photo field has content
+        # Check Actual_Photo field has content (record-level pool).
         actual_photo_raw = record.get("Actual_Photo1")
         file_paths = extract_file_paths_from_field(actual_photo_raw)
         if not file_paths:
-            logger.debug("Skipping record %s (%s): no actual photos", record_id, product_name)
+            logger.debug("Skipping record %s: no actual photos", record_id)
             continue
 
-        counts["processed"] += 1
-        logger.info("Processing: %s (%d photos)", product_name, len(file_paths))
+        for item in items:
+            item_product_name = item["product_name"]
+            item_sku          = item["sku"]
+            item_label        = item_product_name or item_sku or item["item_id"]
+            if not item_label:
+                continue
 
-        if dry_run:
-            logger.info("[DRY RUN] Would upload %d photos for %s", len(file_paths), product_name)
-            photo_names = file_paths[:3]
-            append_csv_report(
-                report_path,
-                product_name,
-                "(dry run)",
-                "dry_run",
-                photo_names[0] if len(photo_names) > 0 else "",
-                photo_names[1] if len(photo_names) > 1 else "",
-                photo_names[2] if len(photo_names) > 2 else "",
-                f"{len(file_paths)} photos would be uploaded",
+            # Apply product filter at item granularity.
+            if product_filter and product_filter.lower() not in (
+                f"{item_product_name} {item_sku}".lower()
+            ):
+                continue
+
+            # Per-item state key so multi-item records remember which items
+            # have already been uploaded to Akeneo.
+            uploaded_state_key = (
+                f"{record_id}:{item['item_id']}" if item["item_id"] else record_id
             )
-            continue
+            if uploaded_state_key in state.get("uploaded", {}):
+                continue
 
-        # Find product in Akeneo by name
-        product_data, akeneo_id, product_type = akeneo.find_by_name(product_name)
-        if not product_data:
-            logger.warning("Product not found in Akeneo by name: %s", product_name)
-            counts["not_found"] += 1
-            append_csv_report(
-                report_path, product_name, "", "not_found_in_akeneo",
-                notes=f"No product or product-model found with name '{product_name}'",
+            counts["processed"] += 1
+            logger.info(
+                "Processing item '%s' (SKU=%s, %d photo(s) on record)",
+                item_label, item_sku or "?", len(file_paths),
             )
-            state["uploaded"][record_id] = {
-                "product_name": product_name,
-                "akeneo_id": "",
-                "status": "not_found_in_akeneo",
-                "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            save_state(state, state_path)
-            continue
 
-        logger.info("Found in Akeneo: %s (type=%s, code=%s)", product_name, product_type, akeneo_id)
+            if dry_run:
+                logger.info(
+                    "[DRY RUN] Would upload %d photos for item '%s' (SKU=%s)",
+                    len(file_paths), item_label, item_sku or "?",
+                )
+                photo_names = file_paths[:3]
+                append_csv_report(
+                    report_path,
+                    item_label,
+                    "(dry run)",
+                    "dry_run",
+                    photo_names[0] if len(photo_names) > 0 else "",
+                    photo_names[1] if len(photo_names) > 1 else "",
+                    photo_names[2] if len(photo_names) > 2 else "",
+                    f"{len(file_paths)} photos would be uploaded",
+                )
+                continue
 
-        # Check if product already has actual photos
-        if akeneo.product_has_actual_photos(product_data, photo_attributes):
-            logger.info("Skipping %s: already has actual photos in Akeneo", akeneo_id)
-            counts["skipped"] += 1
-            append_csv_report(
-                report_path, product_name, akeneo_id, "already_has_photos",
-                photo_1="existing", photo_2="existing", photo_3="existing",
-                notes="Product already has actual photos",
+            # Look the item up in Akeneo. SKU is the authoritative
+            # identifier; fall back to name match if no SKU is set or the
+            # SKU is not in Akeneo.
+            product_data, akeneo_id, product_type = (None, "", "")
+            if item_sku:
+                pd, pt = akeneo.find_product_or_model(item_sku)
+                if pd:
+                    product_data, akeneo_id, product_type = pd, item_sku, pt
+            if not product_data and item_product_name:
+                product_data, akeneo_id, product_type = (
+                    akeneo.find_by_name(item_product_name)
+                )
+
+            if not product_data:
+                logger.warning(
+                    "Product not found in Akeneo: name='%s' sku='%s'",
+                    item_product_name, item_sku,
+                )
+                counts["not_found"] += 1
+                append_csv_report(
+                    report_path, item_label, "", "not_found_in_akeneo",
+                    notes=(
+                        f"No product or product-model found "
+                        f"(name='{item_product_name}', sku='{item_sku}')"
+                    ),
+                )
+                state["uploaded"][uploaded_state_key] = {
+                    "record_id":    record_id,
+                    "item_id":      item["item_id"],
+                    "product_name": item_product_name,
+                    "sku":          item_sku,
+                    "akeneo_id":    "",
+                    "status":       "not_found_in_akeneo",
+                    "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                save_state(state, state_path)
+                continue
+
+            logger.info(
+                "Found in Akeneo: '%s' (type=%s, code=%s)",
+                item_label, product_type, akeneo_id,
             )
-            state["uploaded"][record_id] = {
-                "product_name": product_name,
-                "akeneo_id": akeneo_id,
-                "status": "already_has_photos",
-                "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            save_state(state, state_path)
-            continue
 
-        # Download and upload photos
-        uploaded_files = ["", "", ""]
-        upload_success = True
+            if akeneo.product_has_actual_photos(product_data, photo_attributes):
+                logger.info("Skipping %s: already has actual photos in Akeneo", akeneo_id)
+                counts["skipped"] += 1
+                append_csv_report(
+                    report_path, item_label, akeneo_id, "already_has_photos",
+                    photo_1="existing", photo_2="existing", photo_3="existing",
+                    notes="Product already has actual photos",
+                )
+                state["uploaded"][uploaded_state_key] = {
+                    "record_id":    record_id,
+                    "item_id":      item["item_id"],
+                    "product_name": item_product_name,
+                    "sku":          item_sku,
+                    "akeneo_id":    akeneo_id,
+                    "status":       "already_has_photos",
+                    "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                save_state(state, state_path)
+                continue
 
-        with TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
+            uploaded_files = ["", "", ""]
+            upload_success = True
 
-            for idx, fp in enumerate(file_paths[:3]):
-                attr_code = photo_attributes[idx] if idx < len(photo_attributes) else None
-                if not attr_code:
-                    logger.warning("No attribute code for photo index %d, skipping", idx)
-                    break
+            with TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
 
-                try:
-                    dest = tmp_path / fp
-                    downloaded = creator.download_file_field_to_path(
-                        crm_app,
-                        encoding_report,
-                        record_id,
-                        "Actual_Photo1",
-                        dest,
-                        filepath=fp,
-                    )
-                    logger.info("Downloaded: %s", downloaded.name)
+                for idx, fp in enumerate(file_paths[:3]):
+                    attr_code = photo_attributes[idx] if idx < len(photo_attributes) else None
+                    if not attr_code:
+                        logger.warning("No attribute code for photo index %d, skipping", idx)
+                        break
 
-                    response = akeneo.upload_media_file(
-                        downloaded,
-                        akeneo_id,
-                        attr_code,
-                        product_type=product_type,
-                        scope=None,
-                        locale=None,
-                    )
-                    if response.status_code == 201:
-                        uploaded_files[idx] = downloaded.name
-                    else:
-                        upload_success = False
-                        uploaded_files[idx] = f"FAILED:{response.status_code}"
-                        logger.error(
-                            "Upload failed for %s -> %s.%s: %s",
-                            downloaded.name, akeneo_id, attr_code, response.text[:300],
+                    try:
+                        dest = tmp_path / fp
+                        downloaded = creator.download_file_field_to_path(
+                            crm_app,
+                            encoding_report,
+                            record_id,
+                            "Actual_Photo1",
+                            dest,
+                            filepath=fp,
                         )
-                except Exception as exc:
-                    upload_success = False
-                    uploaded_files[idx] = f"ERROR:{exc}"
-                    logger.exception(
-                        "Error processing photo %d for %s", idx + 1, product_name
-                    )
+                        logger.info("Downloaded: %s", downloaded.name)
 
-        if upload_success and any(f and not f.startswith(("FAILED:", "ERROR:")) for f in uploaded_files):
-            counts["uploaded"] += 1
-            status = "uploaded"
-        else:
-            counts["error"] += 1
-            status = "error"
+                        response = akeneo.upload_media_file(
+                            downloaded,
+                            akeneo_id,
+                            attr_code,
+                            product_type=product_type,
+                            scope=None,
+                            locale=None,
+                        )
+                        if response.status_code == 201:
+                            uploaded_files[idx] = downloaded.name
+                        else:
+                            upload_success = False
+                            uploaded_files[idx] = f"FAILED:{response.status_code}"
+                            logger.error(
+                                "Upload failed for %s -> %s.%s: %s",
+                                downloaded.name, akeneo_id, attr_code, response.text[:300],
+                            )
+                    except Exception as exc:
+                        upload_success = False
+                        uploaded_files[idx] = f"ERROR:{exc}"
+                        logger.exception(
+                            "Error processing photo %d for '%s'", idx + 1, item_label
+                        )
 
-        append_csv_report(
-            report_path, product_name, akeneo_id, status,
-            uploaded_files[0], uploaded_files[1], uploaded_files[2],
-        )
-        state["uploaded"][record_id] = {
-            "product_name": product_name,
-            "akeneo_id": akeneo_id,
-            "status": status,
-            "files_uploaded": sum(1 for f in uploaded_files if f and not f.startswith(("FAILED:", "ERROR:"))),
-            "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        save_state(state, state_path)
+            if upload_success and any(
+                f and not f.startswith(("FAILED:", "ERROR:")) for f in uploaded_files
+            ):
+                counts["uploaded"] += 1
+                status = "uploaded"
+            else:
+                counts["error"] += 1
+                status = "error"
+
+            append_csv_report(
+                report_path, item_label, akeneo_id, status,
+                uploaded_files[0], uploaded_files[1], uploaded_files[2],
+            )
+            state["uploaded"][uploaded_state_key] = {
+                "record_id":      record_id,
+                "item_id":        item["item_id"],
+                "product_name":   item_product_name,
+                "sku":            item_sku,
+                "akeneo_id":      akeneo_id,
+                "status":         status,
+                "files_uploaded": sum(
+                    1 for f in uploaded_files
+                    if f and not f.startswith(("FAILED:", "ERROR:"))
+                ),
+                "processed_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            save_state(state, state_path)
 
     return counts
 

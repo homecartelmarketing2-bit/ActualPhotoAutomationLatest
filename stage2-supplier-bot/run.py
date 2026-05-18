@@ -46,45 +46,45 @@ def _format_invalid_reason(missing_fields: list[str]) -> str:
     return f"Missing required fields: {', '.join(missing_fields)}"
 
 
-def _mark_invalid_record(state: dict, record_id: str, missing_fields: list[str],
+def _mark_invalid_record(state: dict, pending_key: str, missing_fields: list[str],
                          product_name: str, akeneo_identifier: str, context: str):
     reason = _format_invalid_reason(missing_fields)
     should_alert = state_mod.mark_invalid_record(
         state,
-        record_id,
+        pending_key,
         reason,
         product_name=product_name,
         akeneo_identifier=akeneo_identifier,
     )
     if should_alert:
         bot.send_invalid_record_alert(
-            record_id,
+            pending_key,
             missing_fields,
             product_name,
             akeneo_identifier,
             context,
         )
-    log.warning(f"{context}: skipped invalid record {record_id} ({reason})")
+    log.warning(f"{context}: skipped invalid pending entry {pending_key} ({reason})")
 
 
 def _clear_invalid_pending_entries(state: dict, context: str):
-    for record_id, entry in list(state.get("pending", {}).items()):
+    for pending_key, entry in list(state.get("pending", {}).items()):
         product_name = entry.get("product_name", "")
         akeneo_identifier = entry.get("akeneo_identifier", "")
         missing_fields = bot.missing_request_fields(product_name, akeneo_identifier)
         if not missing_fields:
             continue
 
-        state_mod.remove_pending(state, record_id)
+        state_mod.remove_pending(state, pending_key)
         _mark_invalid_record(
             state,
-            record_id,
+            pending_key,
             missing_fields,
             product_name,
             akeneo_identifier,
             context,
         )
-        log.info(f"{context}: removed invalid pending entry {record_id}")
+        log.info(f"{context}: removed invalid pending entry {pending_key}")
 
 
 # ── Thread 1: Zoho poller ────────────────────────────────────────────────────
@@ -129,112 +129,203 @@ def _poll_once(state: dict):
         record_id = str(record.get("ID", ""))
         if not record_id:
             continue
-        if state_mod.is_pending(state, record_id):
-            continue   # Already waiting for reply
 
-        product_name = _extract_product_name(record)
         # Remarks_Notes2 is the "Sales Notes" field in the Zoho UI
         sales_notes  = str(record.get("Remarks_Notes2") or "").strip()
         request_type = str(record.get("Type_of_Request") or "").strip()
         current_status = str(record.get("Request_Status") or "").strip()
 
-        # Skip records we have already processed for this request type, unless
-        # they have been re-opened (Request_Status is back to Pending /
-        # In progress). This is what stops "Supplier Actual Photo" records
-        # from being re-sent on every poll once they're Done / NOT AVAILABLE.
-        if state_mod.is_processed(state, record_id, request_type):
-            if current_status in config.OPEN_STATUSES:
+        items = _extract_items(record)
+        if not items:
+            # Legacy fallback: a record with no subform rows.  Skip and warn.
+            log.warning(
+                f"poller: record {record_id} has no items in Product_Name1 "
+                f"subform; skipping."
+            )
+            continue
+
+        record_status_updated_this_cycle = False
+
+        for item in items:
+            item_id      = item["item_id"]
+            product_name = item["product_name"]
+            sku_from_subform = item["sku"]
+            pending_key = state_mod.item_pending_key(record_id, item_id)
+
+            if state_mod.is_pending(state, pending_key):
+                continue   # Already waiting for reply on this item
+
+            # Skip items already processed for this request type, unless the
+            # parent record has been re-opened (Request_Status is back to
+            # Pending / In progress) or the request_type has changed. This is
+            # what stops "Supplier Actual Photo" items from being re-sent on
+            # every poll once they're Done / Not available.
+            if state_mod.is_processed(state, pending_key, request_type):
+                if current_status in config.OPEN_STATUSES:
+                    log.info(
+                        f"Item {pending_key} previously processed but its "
+                        f"record is now {current_status!r} again — "
+                        f"re-processing."
+                    )
+                    state_mod.clear_processed(state, pending_key)
+                else:
+                    log.debug(
+                        f"Skipping item {pending_key} (already processed, "
+                        f"status={current_status!r})."
+                    )
+                    continue
+
+            log.info(
+                f"New pending item: record={record_id} item={item_id} "
+                f"Type={request_type!r} Product={product_name!r} "
+                f"SKU={sku_from_subform!r} Status={current_status!r}"
+            )
+
+            # Prefer the SKU from the Zoho subform — that is the authoritative
+            # identifier sales typed in. Use Akeneo lookup only to fetch the
+            # catalog photo (and as a fallback if the subform SKU is empty).
+            akeneo_identifier = sku_from_subform
+            photo_bytes = None
+            lookup_failed = False
+            try:
+                if sku_from_subform:
+                    photo_bytes, _ = akeneo.get_catalog_photo_bytes(sku_from_subform)
+                if not photo_bytes and product_name:
+                    photo_bytes, _ = akeneo.get_catalog_photo_bytes(product_name)
+                if not akeneo_identifier and product_name:
+                    looked_up_id, _, has_actual, more_photo_bytes = (
+                        akeneo.lookup_product(product_name)
+                    )
+                    akeneo_identifier = looked_up_id or akeneo_identifier
+                    if not photo_bytes:
+                        photo_bytes = more_photo_bytes
+                    if has_actual:
+                        log.info(
+                            f"  Akeneo already has actual photo for "
+                            f"'{product_name}', but we will NOT skip "
+                            f"requesting it as per user configuration."
+                        )
+            except Exception as exc:
+                lookup_failed = True
+                log.warning(
+                    f"  Akeneo lookup failed for '{product_name}' "
+                    f"(SKU={sku_from_subform!r}): {exc}"
+                )
+
+            missing_fields = bot.missing_request_fields(product_name, akeneo_identifier)
+            if missing_fields:
+                if lookup_failed and missing_fields == ["SKU"]:
+                    log.warning(
+                        f"  Will retry item {pending_key} next poll because "
+                        f"Akeneo lookup failed before resolving the SKU."
+                    )
+                    continue
+                _mark_invalid_record(
+                    state,
+                    pending_key,
+                    missing_fields,
+                    product_name,
+                    akeneo_identifier,
+                    "poller",
+                )
+                continue
+
+            state_mod.clear_invalid_record(state, pending_key)
+
+            if _dry_run:
                 log.info(
-                    f"Record {record_id} previously processed but is now "
-                    f"{current_status!r} again — re-processing."
+                    f"  [dry-run] Would send Telegram to chat_id={chat_id} "
+                    f"for item {pending_key} "
+                    f"(Type={request_type!r}, Product={product_name!r}, "
+                    f"SKU={akeneo_identifier!r}, catalog_photo="
+                    f"{'yes' if photo_bytes else 'no'})"
                 )
-                state_mod.clear_processed(state, record_id)
-            else:
-                log.debug(
-                    f"Skipping record {record_id} (already processed, "
-                    f"status={current_status!r})."
+                if not record_status_updated_this_cycle:
+                    log.info(
+                        f"  [dry-run] Would set Request_Status='In progress' "
+                        f"on Zoho record {record_id}"
+                    )
+                    record_status_updated_this_cycle = True
+                continue
+
+            message_id = bot.send_photo_request(
+                chat_id, product_name, akeneo_identifier, sales_notes, photo_bytes,
+                request_type=request_type,
+            )
+            if message_id is None:
+                log.error(
+                    f"  Failed to send Telegram message for item "
+                    f"{pending_key}. Will retry next poll."
                 )
                 continue
 
-        log.info(f"New pending record: {record_id}  Type={request_type!r}  Product={product_name}  Status={current_status!r}")
-
-        # Single Akeneo lookup — gets identifier, actual photo status, and catalog photo
-        akeneo_identifier = ""
-        photo_bytes = None
-        lookup_failed = False
-        try:
-            if product_name:
-                akeneo_identifier, _, has_actual, photo_bytes = akeneo.lookup_product(product_name)
-                # The user requested to NOT skip even if Akeneo already has an actual photo.
-                if has_actual:
-                    log.info(f"  Akeneo already has actual photo for '{product_name}', but we will NOT skip requesting it as per user configuration.")
-        except Exception as exc:
-            lookup_failed = True
-            log.warning(f"  Akeneo lookup failed for '{product_name}': {exc}")
-
-        missing_fields = bot.missing_request_fields(product_name, akeneo_identifier)
-        if missing_fields:
-            if lookup_failed and missing_fields == ["SKU"]:
-                log.warning(f"  Will retry record {record_id} next poll because Akeneo lookup failed before resolving the SKU.")
-                continue
-            _mark_invalid_record(
-                state,
-                record_id,
-                missing_fields,
-                product_name,
-                akeneo_identifier,
-                "poller",
+            sent_time = _now_iso()
+            state_mod.add_pending(
+                state, pending_key, product_name, sales_notes,
+                akeneo_identifier, message_id, sent_time,
+                request_type=request_type,
+                record_id=record_id,
+                item_id=item_id,
             )
-            continue
 
-        state_mod.clear_invalid_record(state, record_id)
+            # Update Zoho status to show we are waiting (once per record per
+            # poll cycle — it's idempotent but we don't need to spam).
+            if not record_status_updated_this_cycle:
+                try:
+                    zoho.update_record(record_id, {
+                        "Request_Status": config.STATUS_IN_PROGRESS,
+                    })
+                except Exception as exc:
+                    log.warning(
+                        f"  Could not update Zoho record {record_id} status: {exc}"
+                    )
+                record_status_updated_this_cycle = True
 
-        if _dry_run:
             log.info(
-                f"  [dry-run] Would send Telegram to chat_id={chat_id} "
-                f"for record {record_id} "
-                f"(Type={request_type!r}, Product={product_name!r}, "
-                f"SKU={akeneo_identifier!r}, catalog_photo="
-                f"{'yes' if photo_bytes else 'no'})"
+                f"  Sent Telegram request for item {pending_key} "
+                f"(msg_id={message_id})"
             )
-            log.info(
-                f"  [dry-run] Would set Request_Status='In progress' on Zoho record {record_id}"
-            )
+
+
+def _extract_items(record: dict) -> list[dict]:
+    """
+    Extract the list of items from the Zoho `Product_Name1` subform.
+
+    Each row of the subform represents one product/SKU that sales added to
+    the encoding request. We treat each row as a SEPARATE work item: one
+    Telegram message kay Tony, one Akeneo upload per SKU.
+
+    Returns a list of dicts with keys: item_id, product_name, sku.
+    Returns an empty list if the subform is absent or empty (caller should
+    skip the record in that case).
+    """
+    subform = record.get("Product_Name1")
+    if not isinstance(subform, list):
+        return []
+
+    items: list[dict] = []
+    for row in subform:
+        if not isinstance(row, dict):
             continue
-
-        # Send to Telegram
-        message_id = bot.send_photo_request(
-            chat_id, product_name, akeneo_identifier, sales_notes, photo_bytes,
-            request_type=request_type,
-        )
-        if message_id is None:
-            log.error(f"  Failed to send Telegram message for record {record_id}. Will retry next poll.")
+        item_id = str(row.get("ID") or "").strip()
+        sku     = str(row.get("SKU") or "").strip()
+        items_obj = row.get("Items") or {}
+        if isinstance(items_obj, dict):
+            product_name = str(
+                items_obj.get("Item_Name")
+                or items_obj.get("zc_display_value")
+                or ""
+            ).strip()
+        else:
+            product_name = str(items_obj or "").strip()
+        if not item_id and not sku and not product_name:
             continue
-
-        sent_time = _now_iso()
-        state_mod.add_pending(
-            state, record_id, product_name, sales_notes,
-            akeneo_identifier, message_id, sent_time,
-            request_type=request_type,
-        )
-
-        # Update Zoho status to show we are waiting
-        try:
-            zoho.update_record(record_id, {
-                "Request_Status": config.STATUS_IN_PROGRESS,
-            })
-        except Exception as exc:
-            log.warning(f"  Could not update Zoho record {record_id} status: {exc}")
-
-        log.info(f"  Sent Telegram request for {record_id} (msg_id={message_id})")
-
-
-def _extract_product_name(record: dict) -> str:
-    for key in ("Product_Name", "Product_name", "product_name", "Name", "name"):
-        val = record.get(key)
-        if val and str(val).strip():
-            return str(val).strip()
-    return ""
+        items.append({
+            "item_id":      item_id,
+            "product_name": product_name,
+            "sku":          sku,
+        })
+    return items
 
 
 # ── Thread 2: Follow-up ──────────────────────────────────────────────────────
@@ -265,15 +356,18 @@ def _followup_once(state: dict):
            >= config.FOLLOWUP_INTERVAL
     ]
 
-    for record_id, entry in to_resend:
-        log.info(f"Follow-up: resending request for record {record_id} (SKU: {entry.get('akeneo_identifier', 'N/A')})")
-        new_msg_id = bot.resend_request(chat_id, record_id, entry)
+    for pending_key, entry in to_resend:
+        log.info(
+            f"Follow-up: resending request for item {pending_key} "
+            f"(SKU: {entry.get('akeneo_identifier', 'N/A')})"
+        )
+        new_msg_id = bot.resend_request(chat_id, pending_key, entry)
         if new_msg_id:
             # Register the new message_id so replies to it are still matched
-            state_mod.register_message(state, record_id, new_msg_id, _now_iso())
+            state_mod.register_message(state, pending_key, new_msg_id, _now_iso())
             log.info(f"  Follow-up sent (new msg_id={new_msg_id})")
         else:
-            log.warning(f"  Follow-up send failed for {record_id}")
+            log.warning(f"  Follow-up send failed for {pending_key}")
 
 
 # ── Thread 3: Telegram long-poll ─────────────────────────────────────────────

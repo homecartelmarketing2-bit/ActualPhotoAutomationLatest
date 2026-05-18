@@ -1,22 +1,35 @@
 """
 Persistent JSON state for the HC SPEC bot.
 
+A Zoho "Encoding Request" record can carry multiple items in its
+`Product_Name1` subform (each item = one product/SKU). We treat each
+item as a separate work unit: one Telegram message kay Tony, one
+Akeneo upload per SKU. To track them independently we key `pending`
+and `processed_records` by `"<record_id>:<item_id>"` (use
+`item_pending_key()` to build the key).
+
 Schema:
 {
   "telegram_chat_id": -1001234567890,
   "telegram_update_offset": 0,
   "pending": {
-    "<record_id>": {
-      "sku": "10227P/11",
-      "product_name": "Tartarus | Chandelier",
-      "sales_notes": "...",
-      "telegram_message_id": 456,
-      "sent_time": "2026-04-13T10:00:00",
-      "last_sent_time": "2026-04-13T10:00:00"
+    "<record_id>:<item_id>": {
+      "record_id":            "<record_id>",
+      "item_id":              "<item_id>",
+      "product_name":         "Tartarus | Chandelier",
+      "akeneo_identifier":    "10227P/11",
+      "sales_notes":          "...",
+      "request_type":         "Actual Photo",
+      "telegram_message_id":  456,
+      "sent_time":            "2026-04-13T10:00:00",
+      "last_sent_time":       "2026-04-13T10:00:00"
     }
   },
   "message_to_record": {
-    "456": "<record_id>"
+    "456": "<record_id>:<item_id>"
+  },
+  "processed_records": {
+    "<record_id>:<item_id>": { ... }
   }
 }
 """
@@ -101,11 +114,39 @@ def set_chat_id(state: dict, chat_id: int):
     save(state)
 
 
-def add_pending(state: dict, record_id: str, product_name: str, sales_notes: str,
+def item_pending_key(record_id: str, item_id: str) -> str:
+    """
+    Build the composite key used to track one item of a Zoho record.
+
+    `record_id` is the parent encoding request; `item_id` is the
+    `Product_Name1[*].ID` of the subform row. Legacy callers without
+    item_id should pass an empty string — the key still works but
+    represents the whole record.
+    """
+    return f"{record_id}:{item_id}"
+
+
+def split_pending_key(pending_key: str) -> tuple[str, str]:
+    """Inverse of `item_pending_key()`. Returns (record_id, item_id)."""
+    if ":" not in pending_key:
+        # Legacy: pre-subform keys were just the bare record_id.
+        return pending_key, ""
+    record_id, _, item_id = pending_key.partition(":")
+    return record_id, item_id
+
+
+def add_pending(state: dict, pending_key: str, product_name: str, sales_notes: str,
                 akeneo_identifier: str, message_id: int, sent_time: str,
-                request_type: str = ""):
+                request_type: str = "",
+                record_id: str = "", item_id: str = ""):
+    if not record_id:
+        record_id, _maybe_item = split_pending_key(pending_key)
+        if not item_id:
+            item_id = _maybe_item
     with _lock:
-        state["pending"][record_id] = {
+        state["pending"][pending_key] = {
+            "record_id":          record_id,
+            "item_id":            item_id,
             "product_name":       product_name,
             "sales_notes":        sales_notes,
             "akeneo_identifier":  akeneo_identifier,   # Akeneo product id/code for uploads
@@ -114,48 +155,65 @@ def add_pending(state: dict, record_id: str, product_name: str, sales_notes: str
             "sent_time":          sent_time,
             "last_sent_time":     sent_time,
         }
-        state["message_to_record"][str(message_id)] = record_id
+        state["message_to_record"][str(message_id)] = pending_key
     save(state)
 
 
-def remove_pending(state: dict, record_id: str):
+def remove_pending(state: dict, pending_key: str):
     with _lock:
-        state["pending"].pop(record_id, None)
+        state["pending"].pop(pending_key, None)
         stale_message_ids = [
             message_id
-            for message_id, mapped_record_id in state["message_to_record"].items()
-            if mapped_record_id == record_id
+            for message_id, mapped_key in state["message_to_record"].items()
+            if mapped_key == pending_key
         ]
         for message_id in stale_message_ids:
             state["message_to_record"].pop(message_id, None)
     save(state)
 
 
-def register_message(state: dict, record_id: str, message_id: int, sent_time: str | None = None):
+def register_message(state: dict, pending_key: str, message_id: int, sent_time: str | None = None):
     with _lock:
-        if record_id in state["pending"]:
-            state["pending"][record_id]["telegram_message_id"] = message_id
+        if pending_key in state["pending"]:
+            state["pending"][pending_key]["telegram_message_id"] = message_id
             if sent_time:
-                state["pending"][record_id]["last_sent_time"] = sent_time
-        state["message_to_record"][str(message_id)] = record_id
+                state["pending"][pending_key]["last_sent_time"] = sent_time
+        state["message_to_record"][str(message_id)] = pending_key
     save(state)
 
 
-def update_last_sent(state: dict, record_id: str, last_sent_time: str):
+def update_last_sent(state: dict, pending_key: str, last_sent_time: str):
     with _lock:
-        if record_id in state["pending"]:
-            state["pending"][record_id]["last_sent_time"] = last_sent_time
+        if pending_key in state["pending"]:
+            state["pending"][pending_key]["last_sent_time"] = last_sent_time
     save(state)
 
 
 def record_id_for_message(state: dict, message_id: int) -> str | None:
+    """
+    Map a Telegram message_id back to the pending key it belongs to.
+
+    The function is named `record_id_for_message` for backward
+    compatibility, but with the subform refactor it now returns the
+    composite pending_key (`<record_id>:<item_id>`).
+    """
     with _lock:
         return state["message_to_record"].get(str(message_id))
 
 
-def is_pending(state: dict, record_id: str) -> bool:
+def is_pending(state: dict, pending_key: str) -> bool:
     with _lock:
-        return record_id in state["pending"]
+        return pending_key in state["pending"]
+
+
+def pending_keys_for_record(state: dict, record_id: str) -> list[str]:
+    """Return all pending_keys currently waiting on a reply for `record_id`."""
+    prefix = f"{record_id}:"
+    with _lock:
+        return [
+            key for key in state["pending"]
+            if key == record_id or key.startswith(prefix)
+        ]
 
 
 def mark_invalid_record(
@@ -191,7 +249,7 @@ def clear_invalid_record(state: dict, record_id: str) -> bool:
 
 def mark_processed(
     state: dict,
-    record_id: str,
+    pending_key: str,
     request_type: str,
     *,
     final_status: str = "",
@@ -199,16 +257,22 @@ def mark_processed(
     akeneo_identifier: str = "",
 ) -> None:
     """
-    Record that we have finished processing a record so the poller does not
+    Record that we have finished processing an item so the poller does not
     immediately pick it up again on the next cycle.
 
-    Used mainly for "Supplier Actual Photo" records, which are now polled
+    `pending_key` is the composite `<record_id>:<item_id>` produced by
+    `item_pending_key()`.
+
+    Used mainly for "Supplier Actual Photo" items, which are now polled
     regardless of Request_Status — once the supplier has replied and the
-    record has been marked Done / NOT AVAILABLE, we don't want to re-send the
+    item has been resolved Done / Not available, we don't want to re-send the
     Telegram request on every poll.
     """
+    record_id, item_id = split_pending_key(pending_key)
     with _lock:
-        state["processed_records"][record_id] = {
+        state["processed_records"][pending_key] = {
+            "record_id":         record_id,
+            "item_id":           item_id,
             "request_type":      request_type,
             "final_status":      final_status,
             "product_name":      product_name,
@@ -218,10 +282,10 @@ def mark_processed(
     save(state)
 
 
-def is_processed(state: dict, record_id: str, request_type: str) -> bool:
-    """Return True if we previously processed this record for this request type."""
+def is_processed(state: dict, pending_key: str, request_type: str) -> bool:
+    """Return True if we previously processed this item for this request type."""
     with _lock:
-        entry = state["processed_records"].get(record_id)
+        entry = state["processed_records"].get(pending_key)
         if not entry:
             return False
         # If the dropdown has been changed to a different request type since we
@@ -231,11 +295,20 @@ def is_processed(state: dict, record_id: str, request_type: str) -> bool:
         return True
 
 
-def clear_processed(state: dict, record_id: str) -> bool:
-    """Forget a previously processed record so it can be re-sent if needed."""
+def clear_processed(state: dict, pending_key: str) -> bool:
+    """Forget a previously processed item so it can be re-sent if needed."""
     removed = False
     with _lock:
-        removed = state["processed_records"].pop(record_id, None) is not None
+        removed = state["processed_records"].pop(pending_key, None) is not None
     if removed:
         save(state)
     return removed
+
+
+def processed_items_for_record(state: dict, record_id: str) -> list[dict]:
+    """Return all processed entries belonging to a single record_id."""
+    with _lock:
+        return [
+            entry for entry in state["processed_records"].values()
+            if entry.get("record_id") == record_id
+        ]

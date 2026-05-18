@@ -18,6 +18,7 @@ from .helpers import (
     build_search_terms,
     creator_criteria_value,
     extract_record_id,
+    extract_subform_items,
     media_kind,
     scalar_to_text,
     unique_media,
@@ -314,7 +315,32 @@ class ActualPhotoAutomation:
         self, record: dict[str, Any], *, dry_run: bool = False
     ) -> ProcessingOutcome:
         record_id = extract_record_id(record)
-        product_name = scalar_to_text(record.get(self.config["field_product_name"]))
+
+        # Production records carry the real product/SKU data in the
+        # `Product_Name1` subform (one row per ordered item). The top-level
+        # `Product_Name` field is usually empty. We treat each subform row as
+        # a SEPARATE work item: separate search across WorkDrive / Kanban /
+        # Akeneo, then combine all the photos we found into the record-level
+        # `Actual_Photo1` field at the end.
+        subform_field = self.config.get("field_product_subform", "Product_Name1")
+        items = extract_subform_items(record, subform_field)
+
+        if items:
+            # Build a combined product_name used by the WorkDrive/Akeneo
+            # search terms and by logging. We still preserve per-item info
+            # in `items` so a future caller could route per-item.
+            product_name = " | ".join(
+                it["product_name"] for it in items if it["product_name"]
+            )
+            if not product_name:
+                product_name = " | ".join(
+                    it["sku"] for it in items if it["sku"]
+                )
+        else:
+            # Legacy fallback: pre-subform records used a scalar
+            # `Product_Name` field directly on the row.
+            product_name = scalar_to_text(record.get(self.config["field_product_name"]))
+
         if not product_name:
             message = "Automation could not determine Product Name."
             logger.warning("%s Record=%s", message, record_id)
@@ -348,33 +374,73 @@ class ActualPhotoAutomation:
                 logger.info("%s (record=%s, product=%s)", message, record_id, product_name)
                 return ProcessingOutcome(record_id, product_name, 0, "skip", message)
 
-        search_terms = build_search_terms(product_name)
+        # Build the list of (search_label, search_term) pairs we will try.
+        # For modern subform records we run a separate search per item so
+        # each SKU/product is given its own chance to match. For legacy
+        # records we keep the original single combined search.
+        if items:
+            search_targets: list[tuple[str, str]] = []
+            for it in items:
+                term = it["product_name"] or it["sku"]
+                label = it["product_name"] or it["sku"] or it["item_id"]
+                if term:
+                    search_targets.append((label, term))
+        else:
+            search_targets = [(product_name, product_name)]
+
         all_media: list[MediaCandidate] = []
         sources: list[str] = []
         matched_name = ""
+        per_item_found: list[dict[str, Any]] = []
 
-        workdrive_match = self.workdrive.find_best_media_match(
-            self.config["workdrive_parent_folder_id"],
-            search_terms,
-            max_depth=int(self.config["workdrive_search_depth"]),
-            parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
-        )
-        if workdrive_match and workdrive_match.media:
-            all_media.extend(workdrive_match.media)
-            sources.append("workdrive")
-            matched_name = workdrive_match.matched_name
-            logger.info("Found %d file(s) in WorkDrive for %s", len(workdrive_match.media), product_name)
+        for label, term in search_targets:
+            item_terms = build_search_terms(term)
+            item_found = 0
 
-        archive_match = self.find_archive_match(product_name)
-        if archive_match and archive_match.media:
-            all_media.extend(archive_match.media)
-            sources.append("archive")
-            if not matched_name:
-                matched_name = archive_match.matched_name
-            logger.info("Found %d file(s) in Archive for %s", len(archive_match.media), product_name)
+            workdrive_match = self.workdrive.find_best_media_match(
+                self.config["workdrive_parent_folder_id"],
+                item_terms,
+                max_depth=int(self.config["workdrive_search_depth"]),
+                parent_folder_ids=self.config.get("workdrive_parent_folder_ids") or None,
+            )
+            if workdrive_match and workdrive_match.media:
+                all_media.extend(workdrive_match.media)
+                if "workdrive" not in sources:
+                    sources.append("workdrive")
+                if not matched_name:
+                    matched_name = workdrive_match.matched_name
+                item_found += len(workdrive_match.media)
+                logger.info(
+                    "Found %d file(s) in WorkDrive for item '%s'",
+                    len(workdrive_match.media), label,
+                )
+
+            archive_match = self.find_archive_match(term)
+            if archive_match and archive_match.media:
+                all_media.extend(archive_match.media)
+                if "archive" not in sources:
+                    sources.append("archive")
+                if not matched_name:
+                    matched_name = archive_match.matched_name
+                item_found += len(archive_match.media)
+                logger.info(
+                    "Found %d file(s) in Archive for item '%s'",
+                    len(archive_match.media), label,
+                )
+
+            per_item_found.append({"label": label, "term": term, "found": item_found})
 
         all_media = unique_media(all_media)
         source_label = "+".join(sources) if sources else "none"
+
+        items_missing = [pi["label"] for pi in per_item_found if pi["found"] == 0]
+        if items_missing and len(per_item_found) > 1:
+            logger.info(
+                "Stage 1 found photos for %d/%d item(s); still missing: %s",
+                len(per_item_found) - len(items_missing),
+                len(per_item_found),
+                ", ".join(items_missing),
+            )
 
         # Generate custom remarks dynamically based on matched sources
         source_names_map = {"archive": "Kanban Notes", "workdrive": "Zoho Drive", "akeneo": "Akeneo"}
@@ -488,15 +554,51 @@ class ActualPhotoAutomation:
                 record_id, uploaded_count, failed_count,
             )
 
-        # #5: Mark success — for both Actual Photo and Specifications, update status to Done
-        # Actual Photo requests remain the only eligible request type here.
+        # If we found photos for SOME items but not all, the record is not
+        # fully resolved — leave the trigger remarks on so Stage 2 picks it
+        # up and asks the supplier for the remaining items. We still keep
+        # the uploaded photos in `Actual_Photo1` for the items that were
+        # found.
+        partial_resolution = bool(items_missing) and len(per_item_found) > 1
         fallback_msg = self.config.get("success_remarks", "This is uploaded by Automated")
+
+        if partial_resolution:
+            missing_str = ", ".join(items_missing)
+            partial_msg = (
+                f"{success_msg or fallback_msg} Items still pending from "
+                f"supplier: {missing_str}. {not_found_msg}"
+            )
+            try:
+                self._update_remarks_only(record_id, partial_msg)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to update partial-resolution remarks for %s: %s",
+                    record_id, exc,
+                )
+            self.state.setdefault("processed", {})[record_id] = {
+                "product_name":     product_name,
+                "source":           source_label,
+                "uploaded_count":   uploaded_count,
+                "items_missing":    items_missing,
+                "processed_at":     time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._save_state()
+            note = (
+                f"Uploaded {uploaded_count} file(s) from {source_label} for "
+                f"{len(per_item_found) - len(items_missing)} item(s); "
+                f"{len(items_missing)} item(s) still need supplier photos."
+            )
+            return ProcessingOutcome(
+                record_id, product_name, uploaded_count, source_label, note
+            )
+
+        # All items resolved (or only one item to begin with) → mark Done.
         self._mark_success(record_id, success_msg or fallback_msg, change_status=True)
         self.state.setdefault("processed", {})[record_id] = {
-            "product_name": product_name,
-            "source": source_label,
+            "product_name":   product_name,
+            "source":         source_label,
             "uploaded_count": uploaded_count,
-            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "processed_at":   time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._save_state()
         note = f"Uploaded {uploaded_count} file(s) from {source_label}: {matched_name}"
@@ -513,10 +615,22 @@ class ActualPhotoAutomation:
         logger.info("Fetched %s pending Actual Photo request(s)", len(records))
         if product_filter:
             filter_lower = product_filter.lower()
-            records = [
-                r for r in records
-                if filter_lower in scalar_to_text(r.get(self.config["field_product_name"])).lower()
-            ]
+            subform_field = self.config.get("field_product_subform", "Product_Name1")
+
+            def _matches(record: dict[str, Any]) -> bool:
+                # Match against the subform items first (production data
+                # lives here), then fall back to the legacy scalar field.
+                for it in extract_subform_items(record, subform_field):
+                    if filter_lower in it["product_name"].lower():
+                        return True
+                    if filter_lower in it["sku"].lower():
+                        return True
+                top_level = scalar_to_text(
+                    record.get(self.config["field_product_name"])
+                )
+                return filter_lower in top_level.lower()
+
+            records = [r for r in records if _matches(r)]
             logger.info("Filtered to %s record(s) matching '%s'", len(records), product_filter)
         # Filter out already-processed records early to save API calls
         unprocessed = []
