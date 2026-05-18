@@ -435,5 +435,387 @@ class AkeneoSlotSelectionTests(unittest.TestCase):
         self.assertEqual(captured.get("attribute"), "another_picture_5")
 
 
+class SubformExtractItemsTests(unittest.TestCase):
+    """run._extract_items() must parse the Product_Name1 subform correctly."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+        for mod_name in ("run",):
+            if mod_name in sys.modules:
+                del sys.modules[mod_name]
+        import run
+        self.run = run
+
+    def test_extracts_each_subform_row(self):
+        record = {
+            "ID": "rec-1",
+            "Product_Name": "",  # top-level intentionally empty
+            "Product_Name1": [
+                {
+                    "ID": "item-A",
+                    "SKU": "XR-B1029-1",
+                    "Items": {"Item_Name": "Rhosyn | Alabaster - 23cm"},
+                },
+                {
+                    "ID": "item-B",
+                    "SKU": "XR-B1029-2",
+                    "Items": {"Item_Name": "Rhosyn | Alabaster - 30cm"},
+                },
+            ],
+        }
+        items = self.run._extract_items(record)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["item_id"], "item-A")
+        self.assertEqual(items[0]["sku"], "XR-B1029-1")
+        self.assertEqual(items[0]["product_name"], "Rhosyn | Alabaster - 23cm")
+        self.assertEqual(items[1]["item_id"], "item-B")
+        self.assertEqual(items[1]["sku"], "XR-B1029-2")
+        self.assertEqual(items[1]["product_name"], "Rhosyn | Alabaster - 30cm")
+
+    def test_returns_empty_when_subform_missing(self):
+        record = {"ID": "rec-1", "Product_Name": "ignored top-level value"}
+        self.assertEqual(self.run._extract_items(record), [])
+
+    def test_handles_zc_display_value_fallback(self):
+        record = {
+            "ID": "rec-1",
+            "Product_Name1": [
+                {
+                    "ID": "item-A",
+                    "SKU": "X1",
+                    "Items": {"zc_display_value": "Display Only Name"},
+                },
+            ],
+        }
+        items = self.run._extract_items(record)
+        self.assertEqual(items[0]["product_name"], "Display Only Name")
+
+    def test_skips_completely_empty_rows(self):
+        record = {
+            "ID": "rec-1",
+            "Product_Name1": [
+                {"ID": "", "SKU": "", "Items": {}},
+                {"ID": "item-A", "SKU": "X1", "Items": {"Item_Name": "A"}},
+            ],
+        }
+        items = self.run._extract_items(record)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["item_id"], "item-A")
+
+
+class MultiItemPendingKeyTests(unittest.TestCase):
+    """State tracking for multiple items in one Zoho record."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+
+    def test_item_pending_key_roundtrip(self):
+        k = self.state.item_pending_key("rec-1", "item-A")
+        self.assertEqual(k, "rec-1:item-A")
+        rid, iid = self.state.split_pending_key(k)
+        self.assertEqual(rid, "rec-1")
+        self.assertEqual(iid, "item-A")
+
+    def test_legacy_key_without_colon_still_splits(self):
+        # Pre-subform pending entries used the bare record_id as the key.
+        rid, iid = self.state.split_pending_key("rec-legacy")
+        self.assertEqual(rid, "rec-legacy")
+        self.assertEqual(iid, "")
+
+    def test_two_items_in_same_record_tracked_independently(self):
+        s = self.state.load()
+        k1 = self.state.item_pending_key("rec-1", "item-A")
+        k2 = self.state.item_pending_key("rec-1", "item-B")
+
+        self.state.add_pending(
+            s, k1, "Lamp A", "", "SKU-A", 100,
+            sent_time="2026-01-01T00:00:00",
+            request_type="Actual Photo",
+            record_id="rec-1", item_id="item-A",
+        )
+        self.state.add_pending(
+            s, k2, "Lamp B", "", "SKU-B", 101,
+            sent_time="2026-01-01T00:00:01",
+            request_type="Actual Photo",
+            record_id="rec-1", item_id="item-B",
+        )
+
+        self.assertTrue(self.state.is_pending(s, k1))
+        self.assertTrue(self.state.is_pending(s, k2))
+
+        keys = self.state.pending_keys_for_record(s, "rec-1")
+        self.assertEqual(sorted(keys), sorted([k1, k2]))
+
+        # Resolving one item leaves the other pending.
+        self.state.remove_pending(s, k1)
+        self.state.mark_processed(
+            s, k1, "Actual Photo",
+            final_status=self.config.STATUS_DONE,
+            product_name="Lamp A", akeneo_identifier="SKU-A",
+        )
+        self.assertFalse(self.state.is_pending(s, k1))
+        self.assertTrue(self.state.is_pending(s, k2))
+        self.assertEqual(self.state.pending_keys_for_record(s, "rec-1"), [k2])
+
+    def test_processed_items_for_record_returns_all(self):
+        s = self.state.load()
+        k1 = self.state.item_pending_key("rec-1", "item-A")
+        k2 = self.state.item_pending_key("rec-1", "item-B")
+        self.state.mark_processed(
+            s, k1, "Actual Photo",
+            final_status=self.config.STATUS_DONE,
+            product_name="Lamp A", akeneo_identifier="SKU-A",
+        )
+        self.state.mark_processed(
+            s, k2, "Actual Photo",
+            final_status=self.config.STATUS_NOT_AVAILABLE,
+            product_name="Lamp B", akeneo_identifier="SKU-B",
+        )
+        entries = self.state.processed_items_for_record(s, "rec-1")
+        statuses = sorted(e["final_status"] for e in entries)
+        self.assertEqual(
+            statuses,
+            sorted([self.config.STATUS_DONE, self.config.STATUS_NOT_AVAILABLE]),
+        )
+
+
+class FinalizeRecordIfCompleteTests(unittest.TestCase):
+    """_finalize_record_if_complete only flips Zoho status once ALL items resolve."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+        if "bot" in sys.modules:
+            del sys.modules["bot"]
+        import bot
+        self.bot = bot
+
+    def test_does_not_set_status_while_other_items_pending(self):
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        s = self.state.load()
+        k1 = self.state.item_pending_key("rec-1", "item-A")
+        k2 = self.state.item_pending_key("rec-1", "item-B")
+
+        # Item B is still waiting for Tony's reply.
+        self.state.add_pending(
+            s, k2, "Lamp B", "", "SKU-B", 101,
+            sent_time="2026-01-01T00:00:01",
+            request_type="Actual Photo",
+            record_id="rec-1", item_id="item-B",
+        )
+        # Item A just got resolved.
+        self.state.mark_processed(
+            s, k1, "Actual Photo",
+            final_status=self.config.STATUS_DONE,
+            product_name="Lamp A", akeneo_identifier="SKU-A",
+        )
+
+        with mock.patch.object(self.bot.zoho, "update_record",
+                               side_effect=fake_update_record):
+            self.bot._finalize_record_if_complete(
+                s, "rec-1",
+                item_outcome=self.config.STATUS_DONE,
+                item_failure_note="",
+            )
+
+        # While item-B is still pending, we must NOT set Request_Status.
+        statuses = [
+            u["fields"].get("Request_Status") for u in zoho_updates
+            if "Request_Status" in u["fields"]
+        ]
+        self.assertEqual(statuses, [])
+
+    def test_sets_done_when_all_items_done(self):
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        s = self.state.load()
+        k1 = self.state.item_pending_key("rec-1", "item-A")
+        k2 = self.state.item_pending_key("rec-1", "item-B")
+        for k, sku in ((k1, "SKU-A"), (k2, "SKU-B")):
+            self.state.mark_processed(
+                s, k, "Actual Photo",
+                final_status=self.config.STATUS_DONE,
+                product_name="Lamp", akeneo_identifier=sku,
+            )
+
+        with mock.patch.object(self.bot.zoho, "update_record",
+                               side_effect=fake_update_record):
+            self.bot._finalize_record_if_complete(
+                s, "rec-1",
+                item_outcome=self.config.STATUS_DONE,
+                item_failure_note="",
+            )
+
+        statuses = [
+            u["fields"].get("Request_Status") for u in zoho_updates
+            if "Request_Status" in u["fields"]
+        ]
+        self.assertEqual(statuses, [self.config.STATUS_DONE])
+
+    def test_sets_not_available_only_when_every_item_is_not_available(self):
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        s = self.state.load()
+        # Two items, both resolved Not available.
+        for iid, sku in (("item-A", "SKU-A"), ("item-B", "SKU-B")):
+            k = self.state.item_pending_key("rec-1", iid)
+            self.state.mark_processed(
+                s, k, "Actual Photo",
+                final_status=self.config.STATUS_NOT_AVAILABLE,
+                product_name="Lamp", akeneo_identifier=sku,
+            )
+
+        with mock.patch.object(self.bot.zoho, "update_record",
+                               side_effect=fake_update_record):
+            self.bot._finalize_record_if_complete(
+                s, "rec-1",
+                item_outcome=self.config.STATUS_NOT_AVAILABLE,
+                item_failure_note="",
+            )
+
+        statuses = [
+            u["fields"].get("Request_Status") for u in zoho_updates
+            if "Request_Status" in u["fields"]
+        ]
+        self.assertEqual(statuses, [self.config.STATUS_NOT_AVAILABLE])
+
+    def test_sets_done_when_mixed_outcomes(self):
+        """At least one Done across items → record status = Done."""
+        zoho_updates: list[dict] = []
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        s = self.state.load()
+        k1 = self.state.item_pending_key("rec-1", "item-A")
+        k2 = self.state.item_pending_key("rec-1", "item-B")
+        self.state.mark_processed(
+            s, k1, "Actual Photo",
+            final_status=self.config.STATUS_DONE,
+            product_name="Lamp A", akeneo_identifier="SKU-A",
+        )
+        self.state.mark_processed(
+            s, k2, "Actual Photo",
+            final_status=self.config.STATUS_NOT_AVAILABLE,
+            product_name="Lamp B", akeneo_identifier="SKU-B",
+        )
+
+        with mock.patch.object(self.bot.zoho, "update_record",
+                               side_effect=fake_update_record):
+            self.bot._finalize_record_if_complete(
+                s, "rec-1",
+                item_outcome=self.config.STATUS_DONE,
+                item_failure_note="",
+            )
+
+        statuses = [
+            u["fields"].get("Request_Status") for u in zoho_updates
+            if "Request_Status" in u["fields"]
+        ]
+        self.assertEqual(statuses, [self.config.STATUS_DONE])
+
+
+class PollerMultiItemTests(unittest.TestCase):
+    """End-to-end: a record with N subform items → N Telegram sends, 1 status update."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.config, self.state = _reload_modules(
+            str(Path(self.tmpdir.name) / "state.json")
+        )
+        for mod_name in ("run", "bot"):
+            if mod_name in sys.modules:
+                del sys.modules[mod_name]
+        import bot
+        import run
+        self.bot = bot
+        self.run = run
+
+    def test_each_subform_item_gets_its_own_telegram_send(self):
+        record = {
+            "ID": "rec-1",
+            "Type_of_Request": "Actual Photo",
+            "Request_Status": "Pending",
+            "Remarks_Notes2": "Not available from Kanban Notes / Zoho Drive / Akeneo",
+            "Product_Name1": [
+                {"ID": "item-A", "SKU": "SKU-A",
+                 "Items": {"Item_Name": "Lamp A"}},
+                {"ID": "item-B", "SKU": "SKU-B",
+                 "Items": {"Item_Name": "Lamp B"}},
+            ],
+        }
+
+        telegram_sends: list[dict] = []
+        zoho_updates:   list[dict] = []
+
+        def fake_send_photo_request(chat_id, product_name, akeneo_identifier,
+                                    sales_notes, photo_bytes, request_type=""):
+            telegram_sends.append({
+                "product_name":      product_name,
+                "akeneo_identifier": akeneo_identifier,
+            })
+            # Pretend Telegram gave us a unique message_id per send.
+            return 1000 + len(telegram_sends)
+
+        def fake_update_record(record_id, fields):
+            zoho_updates.append({"record_id": record_id, "fields": dict(fields)})
+
+        with mock.patch.object(self.run.zoho, "get_pending_records",
+                               return_value=[record]), \
+             mock.patch.object(self.run.zoho, "update_record",
+                               side_effect=fake_update_record), \
+             mock.patch.object(self.run.akeneo, "get_catalog_photo_bytes",
+                               return_value=(None, None)), \
+             mock.patch.object(self.run.akeneo, "lookup_product",
+                               return_value=("", None, False, None)), \
+             mock.patch.object(self.run.bot, "send_photo_request",
+                               side_effect=fake_send_photo_request), \
+             mock.patch.object(self.run.state_mod, "get_chat_id",
+                               return_value=12345):
+            s = self.state.load()
+            self.run._poll_once(s)
+
+        # Two items → two Telegram sends.
+        self.assertEqual(len(telegram_sends), 2)
+        self.assertEqual(
+            sorted(t["akeneo_identifier"] for t in telegram_sends),
+            ["SKU-A", "SKU-B"],
+        )
+
+        # Only ONE status update to In progress for the record (per cycle).
+        in_progress_updates = [
+            u for u in zoho_updates
+            if u["fields"].get("Request_Status") == self.config.STATUS_IN_PROGRESS
+        ]
+        self.assertEqual(len(in_progress_updates), 1)
+
+        # Both items must be in state.pending with composite keys.
+        s_after = self.state.load()
+        self.assertIn("rec-1:item-A", s_after["pending"])
+        self.assertIn("rec-1:item-B", s_after["pending"])
+
+
 if __name__ == "__main__":
     unittest.main()

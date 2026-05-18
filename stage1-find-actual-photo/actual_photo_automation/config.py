@@ -64,6 +64,10 @@ CONFIG: dict[str, Any] = {
         os.getenv("ZOHO_WORKDRIVE_SEARCH_RESULT_LIMIT", "25")
     ),
     "field_product_name": os.getenv("FIELD_PRODUCT_NAME", "Product_Name"),
+    # Subform that holds one row per ordered item. The top-level
+    # `field_product_name` is usually empty in production; the real product
+    # rows live in this subform. Each row has `Items.Item_Name`, `SKU`, `ID`.
+    "field_product_subform": os.getenv("FIELD_PRODUCT_SUBFORM", "Product_Name1"),
     "field_request_type": os.getenv("FIELD_REQUEST_TYPE", "Type_of_Request"),
     "field_request_status": os.getenv("FIELD_REQUEST_STATUS", "Request_Status"),
     "field_actual_media": os.getenv("FIELD_ACTUAL_MEDIA", ""),

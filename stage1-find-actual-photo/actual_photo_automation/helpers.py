@@ -190,6 +190,52 @@ def scalar_to_text(value: Any) -> str:
     return str(value).strip()
 
 
+def extract_subform_items(record: dict[str, Any], subform_field: str) -> list[dict[str, str]]:
+    """
+    Parse the per-item subform (default `Product_Name1`) from a Zoho encoding
+    request record.
+
+    Each subform row represents one product/SKU that sales added to the
+    request. We treat each row as a SEPARATE work unit: separate search,
+    separate Telegram message, separate Akeneo upload.
+
+    Returns a list of dicts: {item_id, product_name, sku}.
+    Returns an empty list if the subform is absent, not an array, or only
+    contains empty rows — callers should fall back to the top-level
+    `Product_Name` for legacy-shaped records in that case.
+    """
+    if not subform_field:
+        return []
+    subform = record.get(subform_field)
+    if not isinstance(subform, list):
+        return []
+
+    items: list[dict[str, str]] = []
+    for row in subform:
+        if not isinstance(row, dict):
+            continue
+        item_id = scalar_to_text(row.get("ID"))
+        sku     = scalar_to_text(row.get("SKU"))
+        items_obj = row.get("Items")
+        product_name = ""
+        if isinstance(items_obj, dict):
+            product_name = (
+                scalar_to_text(items_obj.get("Item_Name"))
+                or scalar_to_text(items_obj.get("zc_display_value"))
+                or scalar_to_text(items_obj.get("display_value"))
+            )
+        elif items_obj is not None:
+            product_name = scalar_to_text(items_obj)
+        if not item_id and not sku and not product_name:
+            continue
+        items.append({
+            "item_id":      item_id,
+            "product_name": product_name,
+            "sku":          sku,
+        })
+    return items
+
+
 def extract_record_id(record: dict[str, Any]) -> str:
     for key in ("ID", "id", "Id"):
         value = scalar_to_text(record.get(key))
